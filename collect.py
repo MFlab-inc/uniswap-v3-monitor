@@ -122,9 +122,17 @@ def inspect_pool(rpc, addr):
 
 
 def find_pool(rpc, c, verbose=False):
-    """全手数料ティア × USDC候補を調べ、流動性が最大のプールを返す"""
+    """全手数料ティア × USDC候補を調べ、流動性が最大のプールを返す。
+
+    liquidity() の生の値はトークンの decimals に依存するため、USDC候補間で
+    decimals が異なる場合（例: 6桁 vs 18桁）は生の整数のまま比較すると経済的な
+    深さの比較にならない。候補ごとに quote 側の decimals を取得し、
+    10**(decimals/2) で正規化してから比較する（liquidity ~ sqrt(x*y) であり、
+    quote側のraw量は10**decimalsに比例するため）。
+    """
     best = None
     usdcs = c["usdc"] if isinstance(c["usdc"], list) else [c["usdc"]]
+    usdc_dec_cache = {}
     for usdc in usdcs:
       for fee in FEE_TIERS:
         addr = "0x" + rpc.eth_call(c["factory"], SEL["getPool"] + enc_a(c["weth"]) + enc_a(usdc) + enc_u(fee))[-40:]
@@ -136,12 +144,18 @@ def find_pool(rpc, c, verbose=False):
         except Exception as e:
             if verbose: print(f"    {fee/10000:>5.2f}%  {addr}  読取失敗 {e}")
             continue
-        if verbose: print(f"    {fee/10000:>5.2f}%  {addr}  liquidity={liq:.3e}")
-        if best is None or liq > best[0]:
-            best = (liq, fee, addr, usdc)
+        if usdc not in usdc_dec_cache:
+            try:
+                usdc_dec_cache[usdc] = int(rpc.eth_call(usdc, SEL["decimals"]), 16)
+            except Exception:
+                usdc_dec_cache[usdc] = 6  # 取得失敗時は標準的な6桁を仮定(比較用の参考値)
+        norm_liq = liq / (10 ** (usdc_dec_cache[usdc] / 2))
+        if verbose: print(f"    {fee/10000:>5.2f}%  {addr}  liquidity={liq:.3e} (正規化後={norm_liq:.3e})")
+        if best is None or norm_liq > best[0]:
+            best = (norm_liq, fee, addr, usdc)
     if not best or best[0] == 0:
         raise RuntimeError("プールが見つかりません（factory/token アドレスを確認してください）")
-    liq, fee, addr, usdc = best
+    _, fee, addr, usdc = best
     c["usdc"] = usdc
     t0 = "0x" + rpc.eth_call(addr, SEL["token0"])[-40:]
     base_is_token0 = t0.lower() == c["weth"].lower()
@@ -199,24 +213,43 @@ def snapshot(rpc, pool, d0, d1, base_is_token0, blk):
 
 
 def block_at(rpc, ts, lo, hi, block_sec):
-    """二分探索ではなく、ブロック間隔から標的を推定して数回で収束させる"""
+    """タイムスタンプ ts に対応するブロック番号を返す。
+
+    まず config.json の block_sec からの概算で数回のうちに収束させる（高速パス。
+    Base で2,184点を111秒で取得できたのはこの経路による）。ただし block_sec の
+    設定が実際の平均ブロック時間と大きくズレている場合（ハードフォークでブロック時間
+    が変わった、設定ミス等）、固定レートの外挿だけでは収束せず同じ2状態を往復し
+    続けることがある。そこで概算が収束しなかった場合は、ブロック番号に対して
+    タイムスタンプが単調増加であることを利用した二分探索にフォールバックし、
+    block_sec の精度に関係なく必ず正しいブロックに収束させる。
+    """
+    lo, hi = max(1, lo), max(1, hi)
     b = min(max(lo, 1), hi)
     for _ in range(16):
         d = ts - rpc.block_ts(b)
-        if abs(d) <= 4:
-            break
+        if abs(d) <= 1:
+            return b
         nb = min(max(b + int(d / block_sec), 1), hi)
         if nb == b:
             break
         b = nb
-    for _ in range(100):
-        if b > 1 and rpc.block_ts(b - 1) >= ts:
-            b -= 1
-        elif b < hi and rpc.block_ts(b) < ts:
-            b += 1
+
+    # --- 二分探索フォールバック ---
+    # 事前条件: block_ts(lo) <= ts <= block_ts(hi) を保証する。
+    if rpc.block_ts(hi) <= ts:
+        return hi
+    guard = 0
+    while lo > 1 and rpc.block_ts(lo) > ts and guard < 64:
+        lo = max(1, lo - (hi - lo) * 2 - 1)  # lo側が足りなければ指数的に広げる
+        guard += 1
+    lo2, hi2 = lo, hi
+    while hi2 - lo2 > 1:
+        mid = (lo2 + hi2) // 2
+        if rpc.block_ts(mid) <= ts:
+            lo2 = mid
         else:
-            break
-    return b
+            hi2 = mid
+    return lo2
 
 
 COLS = ["date", "timestamp", "block", "pool", "pair", "asset_class", "feeTier",
@@ -294,35 +327,53 @@ def run_chain(name, c, backfill_days=0):
     path = f"data/{name}.csv"
     rows = load_csv(path)
     have = {r["date"] for r in rows}
-    latest = rpc.latest()
-    today = datetime.now(timezone.utc).date()
 
-    if backfill_days:
-        targets = [today - timedelta(days=i) for i in range(backfill_days, 0, -1)]
-    else:
-        targets = [today]
+    # プールが前回と変わっていないか確認する。factory探索は毎回「現時点で最も流動性が
+    # 大きいプール」を選び直すため、手数料ティア移行等でプールが変わることがあり得る。
+    # feeGrowthGlobalは別コントラクトの値を跨いで差分を取ってはならないため、
+    # 気付けるよう警告のみ出す（実際のスキップ処理はダッシュボード側のpool列比較で行う）。
+    if rows:
+        prev_pool = rows[-1].get("pool", "")
+        if prev_pool and prev_pool.lower() != pool.lower():
+            print(f"  ⚠ プールが変わりました（前回={prev_pool} → 今回={pool}）。"
+                  f"この日を境に feeGrowthGlobal の差分計算はダッシュボード側でスキップされる")
 
-    cur = max(1, latest - int(backfill_days * 86400 / c["block_sec"]) - 1000) if backfill_days else latest
+    # ここから先は個別チェーンの一時的なRPC不調（eth_blockNumber等）で例外が出ても、
+    # 他のチェーンの処理を止めないようにする。finally で必ず save_csv を呼ぶことで、
+    # 途中で中断しても、その時点までに取得できた分は失われない。
     added = 0
-    for d in targets:
-        ds = d.isoformat()
-        if ds in have:
-            continue
-        ts = int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp())
-        try:
-            blk = latest if not backfill_days else block_at(rpc, ts, cur, latest, c["block_sec"])
-            cur = blk
-            s = snapshot(rpc, pool, d0, d1, base0, blk)
-            rows.append({"date": ds, "timestamp": ts, "pool": pool, "pair": c.get("pair", "?"),
-                         "asset_class": c.get("asset_class", "eth"), "feeTier": fee,
-                         "base_is_token0": base0, "dec0": d0, "dec1": d1, **s})
-            added += 1
-            if added % 30 == 0:
-                print(f"  {ds}  価格 {s['price']:,.4f}  liq={s['liquidity']:.3e}")
-        except Exception as e:
-            print(f"  ! {ds}: {e}")
-    n = save_csv(path, rows)
-    print(f"[{name}] +{added}件 → 計{n}件  (RPC {rpc.n}回)")
+    try:
+        latest = rpc.latest()
+        today = datetime.now(timezone.utc).date()
+
+        if backfill_days:
+            targets = [today - timedelta(days=i) for i in range(backfill_days, 0, -1)]
+        else:
+            targets = [today]
+
+        cur = max(1, latest - int(backfill_days * 86400 / c["block_sec"]) - 1000) if backfill_days else latest
+        for d in targets:
+            ds = d.isoformat()
+            if ds in have:
+                continue
+            ts = int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp())
+            try:
+                blk = latest if not backfill_days else block_at(rpc, ts, cur, latest, c["block_sec"])
+                cur = blk
+                s = snapshot(rpc, pool, d0, d1, base0, blk)
+                rows.append({"date": ds, "timestamp": ts, "pool": pool, "pair": c.get("pair", "?"),
+                             "asset_class": c.get("asset_class", "eth"), "feeTier": fee,
+                             "base_is_token0": base0, "dec0": d0, "dec1": d1, **s})
+                added += 1
+                if added % 30 == 0:
+                    print(f"  {ds}  価格 {s['price']:,.4f}  liq={s['liquidity']:.3e}")
+            except Exception as e:
+                print(f"  ! {ds}: {e}")
+    except Exception as e:
+        print(f"[{name}] 収集を中断しました（{e}）。取得済み分のみ保存します")
+    finally:
+        n = save_csv(path, rows)
+        print(f"[{name}] +{added}件 → 計{n}件  (RPC {rpc.n}回)")
 
 
 def verify():

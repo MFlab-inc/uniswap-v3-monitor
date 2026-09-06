@@ -46,6 +46,8 @@ footer a{color:var(--ink3)}
 <div class="sub">$10,000 を時価±20% レンジで提供した場合の年率手数料利回り。オンチェーンの <code>feeGrowthGlobal</code> 実測値から算出した、<b>プールの規模に依存しない、単位流動性あたりの収益力</b>で比較する。</div>
 
 <div class="filters" id="chain-filters"></div>
+<div class="filters" id="pair-filters"></div>
+<div class="filters" id="fee-filters"></div>
 
 <div class="card">
   <h2>直近の収益力（年率換算）</h2>
@@ -123,7 +125,7 @@ const CHAIN_COLORS = {ethereum:"#6366f1", optimism:"#e11d48", base:"#1a4d6d", ar
 // DefiLlama の chain 表記（"参考"列にのみ使用。取得失敗時は "—" 表示に留める）
 const DEFILLAMA_CHAIN = {ethereum:"Ethereum", optimism:"Optimism", base:"Base", arbitrum:"Arbitrum", bsc:"BSC", unichain:"Unichain"};
 
-const filters = { chain: "all" };
+const filters = { chain: "all", pair: "all", fee: "all" };
 let chartInstances = {};
 
 // ============================================
@@ -163,14 +165,28 @@ async function loadCSV(name) {
 // 日次の手数料・取引量・流動性を算出
 // base_is_token0: 原資産(ETH/BNB等)がtoken0か。price = 原資産1単位あたりの建て通貨量。
 // dec0/dec1 は token0/token1 それぞれの decimals（原資産側か建て通貨側かは base_is_token0 で判定）。
+//
+// 各エントリは t(unixtime秒)・days(前の行からの実際の経過日数)を持つ。RPC失敗等で
+// CSVの日付に欠測があっても、収益力の算出はエントリ数ではなく実際の経過日数で
+// 正規化するため、欠測1日ぶんの手数料が「1日分」として過大計上されることがない。
 // ============================================
 function dailyFees(rows) {
   const Q128 = 2n ** 128n;
   const out = [];
   for (let i = 1; i < rows.length; i++) {
     const p = rows[i - 1], c = rows[i];
+    const tsP = parseInt(p.timestamp, 10), tsC = parseInt(c.timestamp, 10);
+    const days = (tsC - tsP) / 86400;
+    if (!(days > 0)) { out.push({ d: c.date, t: tsC, fee: null }); continue; }
+    // factory探索は毎回「その時点で最も流動性が大きいプール」を選び直すため、
+    // 手数料ティア移行等でプールが変わることがある。feeGrowthGlobalは別コントラクトの
+    // 累積値なので、プールが変わった日はまたいで差分を取らない。
+    if (p.pool && c.pool && p.pool.toLowerCase() !== c.pool.toLowerCase()) {
+      out.push({ d: c.date, t: tsC, fee: null });
+      continue;
+    }
     const px = parseFloat(c.price), P0 = parseFloat(p.price);
-    if (!(px > 0 && P0 > 0)) { out.push({ d: c.date, fee: null }); continue; }
+    if (!(px > 0 && P0 > 0)) { out.push({ d: c.date, t: tsC, fee: null }); continue; }
     // 旧スキーマ（dec0/dec1列なし）のCSVとの後方互換: 18桁/6桁と仮定
     const D0 = parseInt(c.dec0 || "18", 10);
     const D1 = parseInt(c.dec1 || "6", 10);
@@ -180,43 +196,55 @@ function dailyFees(rows) {
 
     let d0, d1;
     try { d0 = BigInt(c.feeGrowthGlobal0X128) - BigInt(p.feeGrowthGlobal0X128); d1 = BigInt(c.feeGrowthGlobal1X128) - BigInt(p.feeGrowthGlobal1X128); }
-    catch (e) { out.push({ d: c.date, fee: null }); continue; }
+    catch (e) { out.push({ d: c.date, t: tsC, fee: null }); continue; }
     // feeGrowthGlobal は稀にオーバーフローで巻き戻る。増分が負の場合はその日をスキップする。
-    if (d0 < 0n || d1 < 0n) { out.push({ d: c.date, fee: null }); continue; }
+    if (d0 < 0n || d1 < 0n) { out.push({ d: c.date, t: tsC, fee: null }); continue; }
 
     const f0 = Number(d0) / Number(Q128), f1 = Number(d1) / Number(Q128);
     // token0が原資産なら fg0は原資産建て(D0桁)・fg1は建て通貨建て(D1桁)。token1が原資産なら逆。
     const fee = base0 ? (L * f0 / 10 ** D0 * px + L * f1 / 10 ** D1)
                        : (L * f0 / 10 ** D0 + L * f1 / 10 ** D1 * px);
     // プール全体の取引量 = (Δ feeGrowthGlobal × アクティブ流動性) ÷ 手数料率
+    // (これは「その期間 = days日ぶん」の総取引量。1日あたりに直すのは呼び出し側で行う)
     const Lp = parseFloat(c.liquidity);
     const poolFee = base0 ? (Lp * f0 / 10 ** D0 * px + Lp * f1 / 10 ** D1)
                            : (Lp * f0 / 10 ** D0 + Lp * f1 / 10 ** D1 * px);
     const vol = poolFee / (parseInt(c.feeTier, 10) / 1e6);
-    out.push({ d: c.date, fee, liq: Lp, vol });
+    out.push({ d: c.date, t: tsC, days, fee, liq: Lp, vol, pair: c.pair, feeTier: c.feeTier });
   }
   return out;
 }
 
-function sumApr(fees, n) {
-  const s = fees.filter(x => x.fee != null).slice(-n);
-  if (s.length < Math.min(n, 7)) return null;
-  const tot = s.reduce((a, x) => a + x.fee, 0);
-  return tot / CAP * 365 / s.length * 100;
+// 末尾から windowDays 暦日以内のエントリだけを合算し、実際の経過日数(days)の合計で
+// 正規化する。エントリ数(count)ではなく実日数で割るため、欠測日があっても
+// その1エントリが実際にカバーする日数ぶんとして正しく按分される。
+function sumApr(fees, windowDays) {
+  const valid = fees.filter(x => x.fee != null);
+  if (!valid.length) return null;
+  const cutoff = valid[valid.length - 1].t - windowDays * 86400;
+  const inWindow = valid.filter(x => x.t > cutoff);
+  const totalDays = inWindow.reduce((a, x) => a + x.days, 0);
+  if (!totalDays || totalDays < Math.min(windowDays, 7)) return null;
+  const totalFee = inWindow.reduce((a, x) => a + x.fee, 0);
+  return totalFee / CAP * 365 / totalDays * 100;
 }
-function maKey(a, n, key) {
-  const r = [];
-  for (let i = 0; i < a.length; i++) {
-    const s = a.slice(Math.max(0, i - n + 1), i + 1).filter(x => x[key] != null && isFinite(x[key]));
-    r.push(s.length ? s.reduce((t, x) => t + x[key], 0) / s.length : null);
-  }
-  return r;
-}
-function maApr(fees, n) {
+
+// チャート用の移動平均。各点 i について、その日付から遡って windowDays 暦日以内の
+// エントリを合算し、実経過日数で正規化する（sumAprと同じ考え方を、系列の各点で行う）。
+// kind: "fee" は年率%（sumAprと同じ式）、"vol" は1日あたり平均値を返す。
+function maWindow(fees, windowDays, kind) {
   const r = [];
   for (let i = 0; i < fees.length; i++) {
-    const s = fees.slice(Math.max(0, i - n + 1), i + 1).filter(x => x.fee != null);
-    r.push(s.length ? s.reduce((a, x) => a + x.fee, 0) / CAP * 365 / s.length * 100 : null);
+    const cutoff = fees[i].t - windowDays * 86400;
+    let total = 0, totalDays = 0;
+    for (let j = i; j >= 0; j--) {
+      if (fees[j].t <= cutoff) break;
+      if (fees[j].fee == null) continue;
+      const v = kind === "fee" ? fees[j].fee : fees[j][kind];
+      if (v != null && isFinite(v)) { total += v; totalDays += fees[j].days; }
+    }
+    if (!totalDays) { r.push(null); continue; }
+    r.push(kind === "fee" ? total / CAP * 365 / totalDays * 100 : total / totalDays);
   }
   return r;
 }
@@ -238,7 +266,17 @@ function pairToRegexes(pair) {
 async function fetchDefiLlamaRef(chainConfigs) {
   const ref = {};
   try {
-    const r = await fetch("https://yields.llama.fi/pools", { cache: "no-store" });
+    // タイムアウト付きfetch: 接続が確立したまま応答が返らない(ハング)場合、
+    // ただのtry/catchでは永久にawaitが解決せずダッシュボード本体の描画まで
+    // 止まってしまう。DefiLlamaはあくまで参考値なので、応答が遅ければ諦める。
+    const ctrl = new AbortController();
+    const timeoutId = setTimeout(() => ctrl.abort(), 8000);
+    let r;
+    try {
+      r = await fetch("https://yields.llama.fi/pools", { cache: "no-store", signal: ctrl.signal });
+    } finally {
+      clearTimeout(timeoutId);
+    }
     if (!r.ok) throw new Error("HTTP " + r.status);
     const j = await r.json();
     if (!j.data || !Array.isArray(j.data)) throw new Error("unexpected shape");
@@ -260,28 +298,43 @@ async function fetchDefiLlamaRef(chainConfigs) {
 }
 
 // ============================================
-// フィルターUI
+// フィルターUI（チェーン／ペア／手数料ティアの3軸。既存サイトからの引き継ぎ要件）
 // ============================================
-function renderFilterButtons(activeChains) {
-  const box = document.getElementById("chain-filters");
-  let html = `<button class="filter-btn active" data-chain="all">全チェーン</button>`;
-  activeChains.forEach(c => html += `<button class="filter-btn" data-chain="${c}">${CHAIN_LABELS[c] || c}</button>`);
-  box.innerHTML = html;
-  box.querySelectorAll(".filter-btn").forEach(btn => {
-    btn.addEventListener("click", () => {
-      box.querySelectorAll(".filter-btn").forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-      filters.chain = btn.dataset.chain;
-      applyFilter();
+const filterAxes = [
+  { key: "chain", id: "chain-filters", allLabel: "全チェーン", labelFor: v => CHAIN_LABELS[v] || v },
+  { key: "pair", id: "pair-filters", allLabel: "全ペア", labelFor: v => v },
+  { key: "fee", id: "fee-filters", allLabel: "全手数料", labelFor: v => (parseInt(v, 10) / 10000).toFixed(2) + "%" },
+];
+
+function renderFilterButtons(rowsMeta) {
+  // rowsMeta: [{chain, pair, fee}] 実際に読み込めたチェーンの行から、軸ごとに
+  // 実在する値だけをボタン化する(値が1種類しかない軸でも「全て」＋その値の2つは出す)。
+  filterAxes.forEach(axis => {
+    const box = document.getElementById(axis.id);
+    if (!box) return;
+    const values = [...new Set(rowsMeta.map(r => r[axis.key]))];
+    let html = `<button class="filter-btn active" data-value="all">${axis.allLabel}</button>`;
+    values.forEach(v => html += `<button class="filter-btn" data-value="${escapeHtml(v)}">${escapeHtml(axis.labelFor(v))}</button>`);
+    box.innerHTML = html;
+    box.querySelectorAll(".filter-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        box.querySelectorAll(".filter-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        filters[axis.key] = btn.dataset.value;
+        applyFilter();
+      });
     });
   });
 }
 function applyFilter() {
   document.querySelectorAll("#tbl tbody tr").forEach(tr => {
-    tr.classList.toggle("filtered-out", filters.chain !== "all" && tr.dataset.chain !== filters.chain);
+    const hidden = filterAxes.some(axis => filters[axis.key] !== "all" && tr.dataset[axis.key] !== filters[axis.key]);
+    tr.classList.toggle("filtered-out", hidden);
   });
   Object.entries(chartInstances).forEach(([_, chart]) => {
-    chart.data.datasets.forEach(ds => { ds.hidden = filters.chain !== "all" && ds._chain !== filters.chain; });
+    chart.data.datasets.forEach(ds => {
+      ds.hidden = filterAxes.some(axis => filters[axis.key] !== "all" && ds[`_${axis.key}`] !== filters[axis.key]);
+    });
     chart.update();
   });
 }
@@ -305,27 +358,28 @@ function applyFilter() {
 
   const tb = document.querySelector("#tbl tbody");
   const ds = [], dl = [], dv = [];
-  const active = [];
+  const rowsMeta = [];
   const llamaRef = await fetchDefiLlamaRef(chainConfigs);
 
   for (const [i, name] of CHAINS.entries()) {
     const rows = await loadCSV(name);
     if (!rows || rows.length < 2) continue;
-    active.push(name);
     const f = dailyFees(rows);
     const a30 = sumApr(f, 30), a90 = sumApr(f, 90), all = sumApr(f, 1e9);
     const last = rows[rows.length - 1];
     const isOther = last.asset_class === "other";
-    const v30 = maKey(f, 30, "vol"), vLast = v30[v30.length - 1];
+    const pair = last.pair || "?", feeTier = last.feeTier;
+    rowsMeta.push({ chain: name, pair, fee: feeTier });
+    const v30 = maWindow(f, 30, "vol"), vLast = v30[v30.length - 1];
     const liqNow = parseFloat(last.liquidity);
     const turn = (vLast != null && liqNow > 0) ? (vLast / liqNow) : null;
     const color = CHAIN_COLORS[name] || "#627eea";
     const llama = llamaRef[name];
 
-    tb.insertAdjacentHTML("beforeend", `<tr data-chain="${name}"${isOther ? ' class="asset-other"' : ""}>
+    tb.insertAdjacentHTML("beforeend", `<tr data-chain="${name}" data-pair="${escapeHtml(pair)}" data-fee="${escapeHtml(feeTier)}"${isOther ? ' class="asset-other"' : ""}>
       <td>${escapeHtml(CHAIN_LABELS[name] || name)}</td>
-      <td>${escapeHtml(last.pair || "?")}${isOther ? '<span class="ref-tag">参考</span>' : ""}</td>
-      <td>${(parseInt(last.feeTier, 10) / 10000).toFixed(2)}%</td>
+      <td>${escapeHtml(pair)}${isOther ? '<span class="ref-tag">参考</span>' : ""}</td>
+      <td>${(parseInt(feeTier, 10) / 10000).toFixed(2)}%</td>
       <td>${a30 == null ? "—" : a30.toFixed(1) + "%"}</td>
       <td>${a90 == null ? "—" : a90.toFixed(1) + "%"}</td>
       <td>${all == null ? "—" : all.toFixed(1) + "%"}</td>
@@ -336,21 +390,25 @@ function applyFilter() {
       <td>${rows.length}</td>
     </tr>`);
 
-    const m30 = maApr(f, 30);
+    const m30 = maWindow(f, 30, "fee");
     // asset_class="other"（原資産がETHでない）は点線で視覚的に区別する
     const lineStyle = isOther ? { borderDash: [5, 4] } : {};
-    ds.push({ label: CHAIN_LABELS[name] || name, _chain: name, data: f.map((x, j) => ({ x: x.d, y: m30[j] })), borderColor: color, borderWidth: 1.8, pointRadius: 0, tension: .2, ...lineStyle });
-    dl.push({ label: CHAIN_LABELS[name] || name, _chain: name, data: f.map(x => ({ x: x.d, y: x.liq })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
-    dv.push({ label: CHAIN_LABELS[name] || name, _chain: name, data: f.map((x, j) => ({ x: x.d, y: v30[j] })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
+    const dsMeta = { _chain: name, _pair: pair, _fee: feeTier };
+    ds.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map((x, j) => ({ x: x.d, y: m30[j] })), borderColor: color, borderWidth: 1.8, pointRadius: 0, tension: .2, ...lineStyle });
+    dl.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map(x => ({ x: x.d, y: x.liq })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
+    dv.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map((x, j) => ({ x: x.d, y: v30[j] })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
   }
 
-  renderFilterButtons(active);
+  renderFilterButtons(rowsMeta);
 
   if (!ds.length) {
     document.getElementById("msg").textContent = "data/ にCSVがありません。collect.py --backfill を実行してデータを用意してください。";
     return;
   }
-  const opt = { responsive: true, parsing: false, scales: { x: { type: "category", ticks: { maxTicksLimit: 10 } } }, plugins: { legend: { position: "bottom" } } };
+  // 注意: parsing:false は指定しない。category スケール + {x,y}オブジェクト形式の
+  // データで parsing:false を指定すると、Chart.js が軸ラベル/目盛りを構築できず
+  // ほぼ全ての点が描画範囲外に押し出される(実際にChart.js 4.4.1で確認済みの不具合)。
+  const opt = { responsive: true, scales: { x: { type: "category", ticks: { maxTicksLimit: 10 } } }, plugins: { legend: { position: "bottom" } } };
   chartInstances.ch = new Chart(document.getElementById("ch"), { type: "line", data: { datasets: ds }, options: { ...opt, scales: { ...opt.scales, y: { title: { display: true, text: "年率手数料利回り %" } } } } });
   chartInstances.vol = new Chart(document.getElementById("vol"), { type: "line", data: { datasets: dv }, options: { ...opt, scales: { ...opt.scales, y: { type: "logarithmic", title: { display: true, text: "1日あたり取引量 USD" } } } } });
   chartInstances.liq = new Chart(document.getElementById("liq"), { type: "line", data: { datasets: dl }, options: { ...opt, scales: { ...opt.scales, y: { type: "logarithmic" } } } });
