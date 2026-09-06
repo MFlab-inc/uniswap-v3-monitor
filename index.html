@@ -76,7 +76,7 @@ footer a{color:var(--ink3)}
 <div class="card">
   <h2>アクティブ流動性の推移（対数）</h2>
   <canvas id="liq"></canvas>
-  <div class="note"><b>収益力が落ちたとき、上の「取引量」と下の「流動性」のどちらが原因かを見る。</b>取引量が伸び悩む一方で流動性だけが増えていれば、参入過多による分配比率の低下（希薄化）を意味する。</div>
+  <div class="note"><b>収益力が落ちたとき、上の「取引量」と下の「流動性」のどちらが原因かを見る。</b>取引量が伸び悩む一方で流動性だけが増えていれば、参入過多による分配比率の低下（希薄化）を意味する。<br>流動性の絶対値はトークンの小数桁に依存するため、桁の異なるチェーン間では比較できない。原資産がETHでないチェーン（BNB Chain）は本グラフから除外している。</div>
 </div>
 
 <div id="msg" class="err"></div>
@@ -397,7 +397,14 @@ function applyFilter() {
     // x はエポックミリ秒(数値)にする。linear スケールで扱うため Date オブジェクトではなく
     // 数値が必要（date アダプタに依存しない — 理由は下の opt 定義のコメント参照）。
     ds.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map((x, j) => ({ x: new Date(x.d).getTime(), y: m30[j] })), borderColor: color, borderWidth: 1.8, pointRadius: 0, tension: .2, ...lineStyle });
-    dl.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map(x => ({ x: new Date(x.d).getTime(), y: x.liq })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
+    // 流動性グラフのみ asset_class="other" を除外する。Uniswap V3 の liquidity は
+    // √(token0の生数量 × token1の生数量) であり、トークンのdecimalsに依存するため、
+    // 桁の異なるチェーン間(例: 他チェーンのUSDCは6桁、BSCのUSDTは18桁)では絶対値を
+    // 比較できない（同じドル額でもdecimalsの差の半分の桁だけ数値がずれる）。
+    // 収益力(1枚目)・取引量(2枚目)は単位が相殺/USD換算済みで比較可能なため対象外。
+    if (!isOther) {
+      dl.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map(x => ({ x: new Date(x.d).getTime(), y: x.liq })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
+    }
     dv.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map((x, j) => ({ x: new Date(x.d).getTime(), y: v30[j] })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
   }
 
