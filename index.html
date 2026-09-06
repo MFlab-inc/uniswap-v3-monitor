@@ -19,6 +19,8 @@ th,td{padding:8px 10px;text-align:right;border-bottom:1px solid #eceff1;white-sp
 th:first-child,td:first-child{text-align:left}
 thead th{background:#eaf0f4;color:var(--cp);font-size:12px}
 tbody tr.filtered-out{display:none}
+tbody tr.asset-other{opacity:.7}
+.ref-tag{font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;background:#fff3e0;color:#b45309;border:1px solid #fcd9a8;margin-left:5px;vertical-align:middle}
 .note{font-size:12px;color:var(--ink3);margin-top:10px;line-height:1.6}
 .note b{color:var(--ink)}
 canvas{max-height:360px}
@@ -28,7 +30,6 @@ canvas{max-height:360px}
 .filter-btn{border:1px solid var(--rule);background:#fff;color:var(--ink3);padding:6px 13px;font-size:12.5px;border-radius:4px;cursor:pointer;font-family:inherit}
 .filter-btn:hover{border-color:var(--cp);color:var(--cp)}
 .filter-btn.active{background:var(--cp);border-color:var(--cp);color:#fff}
-.gecko-tag{display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:3px;background:#ecfdf5;color:#059669;border:1px solid #a7f3d0;margin-left:4px}
 .tools-section{margin-top:8px}
 .tools-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
 .tool-card{background:#fbfcfd;border:1px solid var(--rule);border-radius:6px;padding:14px;text-decoration:none;color:var(--ink);display:flex;flex-direction:column;gap:6px;transition:border-color .15s}
@@ -50,17 +51,18 @@ footer a{color:var(--ink3)}
   <h2>直近の収益力（年率換算）</h2>
   <div class="tbl-wrap">
   <table id="tbl"><thead><tr>
-    <th>チェーン</th><th>手数料ティア</th><th>直近30日</th><th>直近90日</th><th>全期間</th>
+    <th>チェーン</th><th>ペア</th><th>手数料</th><th>直近30日</th><th>直近90日</th><th>全期間</th>
     <th>参考: DefiLlama<br>(フルレンジ)</th>
     <th>取引量/日<br>(30日平均)</th><th>流動性<br>（現在）</th><th>回転率<br>(量÷流動性)</th><th>日数</th>
   </tr></thead><tbody></tbody></table>
   </div>
-  <div class="note">年率利回り = 30/90日間・全期間の手数料合計 ÷ $10,000 × 365/日数。<b>TVLではなく feeGrowthGlobal（流動性1単位あたりの手数料累積値）の実測増分</b>を使用しており、レンジ外で手数料を受け取れない流動性を含む按分より正確。「参考: DefiLlama」列は算出方法が異なる外部値（フルレンジAPR）であり、本指標とは一致しない。取得できないチェーンは「—」。</div>
+  <div class="note"><span class="ref-tag">参考</span> の行は<b>原資産がETHではない</b>ため、収益力（単位流動性あたりの手数料）としての比較は成立するが、原資産のボラティリティが異なりIL特性も異なるため「どこでETHを運用するか」という比較には使えない。<br>年率利回り = 30/90日間・全期間の手数料合計 ÷ $10,000 × 365/日数。<b>TVLではなく feeGrowthGlobal（流動性1単位あたりの手数料累積値）の実測増分</b>を使用しており、レンジ外で手数料を受け取れない流動性を含む按分より正確。「参考: DefiLlama」列は算出方法が異なる外部値（フルレンジAPR）であり、本指標とは一致しない。取得できないチェーンは「—」。</div>
 </div>
 
 <div class="card">
   <h2>収益力の推移（30日移動平均・年率）</h2>
   <canvas id="ch"></canvas>
+  <div class="note"><span class="ref-tag">参考</span> 枠（原資産がETHでないチェーン）は点線で表示する。</div>
 </div>
 
 <div class="card">
@@ -126,7 +128,7 @@ let chartInstances = {};
 
 // ============================================
 // ポジション価値の計算（token0/token1 の decimals を可変に対応）
-// D0: WETH decimals, D1: USDC decimals（チェーンにより 6 でない場合がある: 例 BNB Smart Chain の USDC は 18桁）
+// D0: token0 decimals, D1: token1 decimals（ペアにより6でない場合がある: 例 BNB Smart Chain の USDC/USDT は18桁）
 // ============================================
 function amounts(L, P, Pa, Pb, D0, D1) {
   const SCALE = 10 ** (D1 - D0);
@@ -159,20 +161,22 @@ async function loadCSV(name) {
 
 // ============================================
 // 日次の手数料・取引量・流動性を算出
+// base_is_token0: 原資産(ETH/BNB等)がtoken0か。price = 原資産1単位あたりの建て通貨量。
+// dec0/dec1 は token0/token1 それぞれの decimals（原資産側か建て通貨側かは base_is_token0 で判定）。
 // ============================================
 function dailyFees(rows) {
   const Q128 = 2n ** 128n;
   const out = [];
   for (let i = 1; i < rows.length; i++) {
     const p = rows[i - 1], c = rows[i];
-    const px = parseFloat(c.eth_usd), P0 = parseFloat(p.eth_usd);
+    const px = parseFloat(c.price), P0 = parseFloat(p.price);
     if (!(px > 0 && P0 > 0)) { out.push({ d: c.date, fee: null }); continue; }
-    // 旧スキーマ（decimals列なし）のCSVとの後方互換: WETH=18桁, USDC=6桁と仮定
-    const D0 = parseInt(c.wethDecimals || "18", 10);
-    const D1 = parseInt(c.usdcDecimals || "6", 10);
+    // 旧スキーマ（dec0/dec1列なし）のCSVとの後方互換: 18桁/6桁と仮定
+    const D0 = parseInt(c.dec0 || "18", 10);
+    const D1 = parseInt(c.dec1 || "6", 10);
     const Pa = P0 * (1 - RANGE_W), Pb = P0 * (1 + RANGE_W);
     const L = CAP / value(1, P0, Pa, Pb, D0, D1);
-    const w0 = (c.weth_is_token0 === "True" || c.weth_is_token0 === "true");
+    const base0 = (c.base_is_token0 === "True" || c.base_is_token0 === "true");
 
     let d0, d1;
     try { d0 = BigInt(c.feeGrowthGlobal0X128) - BigInt(p.feeGrowthGlobal0X128); d1 = BigInt(c.feeGrowthGlobal1X128) - BigInt(p.feeGrowthGlobal1X128); }
@@ -181,13 +185,13 @@ function dailyFees(rows) {
     if (d0 < 0n || d1 < 0n) { out.push({ d: c.date, fee: null }); continue; }
 
     const f0 = Number(d0) / Number(Q128), f1 = Number(d1) / Number(Q128);
-    // token0=WETH なら fg0はWETH建て(D0桁)・fg1はUSDC建て(D1桁)。token1=WETHなら逆。
-    const fee = w0 ? (L * f0 / 10 ** D0 * px + L * f1 / 10 ** D1)
-                    : (L * f0 / 10 ** D1 + L * f1 / 10 ** D0 * px);
+    // token0が原資産なら fg0は原資産建て(D0桁)・fg1は建て通貨建て(D1桁)。token1が原資産なら逆。
+    const fee = base0 ? (L * f0 / 10 ** D0 * px + L * f1 / 10 ** D1)
+                       : (L * f0 / 10 ** D0 + L * f1 / 10 ** D1 * px);
     // プール全体の取引量 = (Δ feeGrowthGlobal × アクティブ流動性) ÷ 手数料率
     const Lp = parseFloat(c.liquidity);
-    const poolFee = w0 ? (Lp * f0 / 10 ** D0 * px + Lp * f1 / 10 ** D1)
-                        : (Lp * f0 / 10 ** D1 + Lp * f1 / 10 ** D0 * px);
+    const poolFee = base0 ? (Lp * f0 / 10 ** D0 * px + Lp * f1 / 10 ** D1)
+                           : (Lp * f0 / 10 ** D0 + Lp * f1 / 10 ** D1 * px);
     const vol = poolFee / (parseInt(c.feeTier, 10) / 1e6);
     out.push({ d: c.date, fee, liq: Lp, vol });
   }
@@ -223,9 +227,15 @@ function fmt(v) {
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 
 // ============================================
-// DefiLlama 参考値（フルレンジ apyBase）取得: 失敗しても本体機能には影響しない
+// DefiLlama 参考値（フルレンジ apyBase）取得: 失敗しても本体機能には影響しない。
+// config.json の pair (例: "ETH/USDC", "BNB/USDT") からシンボルパターンを組み立てるため、
+// ETH系以外のペアが増えても追随できる。
 // ============================================
-async function fetchDefiLlamaRef() {
+function pairToRegexes(pair) {
+  const parts = (pair || "").split("/").map(s => s.trim().toUpperCase()).filter(Boolean);
+  return parts.map(p => new RegExp(`(^|-)W?${p}(\\.E)?(-|$)`, "i"));
+}
+async function fetchDefiLlamaRef(chainConfigs) {
   const ref = {};
   try {
     const r = await fetch("https://yields.llama.fi/pools", { cache: "no-store" });
@@ -234,8 +244,11 @@ async function fetchDefiLlamaRef() {
     if (!j.data || !Array.isArray(j.data)) throw new Error("unexpected shape");
     for (const chain of CHAINS) {
       const llamaChain = DEFILLAMA_CHAIN[chain];
+      const cfg = chainConfigs[chain] || {};
+      const regexes = pairToRegexes(cfg.pair);
+      if (!regexes.length) continue;
       const cands = j.data.filter(p => p.project === "uniswap-v3" && p.chain === llamaChain
-        && /(^|-)W?ETH(-|$)/i.test((p.symbol || "").toUpperCase()) && /(^|-)USDC(\.E)?(-|$)/i.test((p.symbol || "").toUpperCase()));
+        && regexes.every(re => re.test((p.symbol || "").toUpperCase())));
       if (!cands.length) continue;
       cands.sort((a, b) => (b.tvlUsd || 0) - (a.tvlUsd || 0));
       ref[chain] = typeof cands[0].apyBase === "number" ? cands[0].apyBase : null;
@@ -277,6 +290,7 @@ function applyFilter() {
 // メイン
 // ============================================
 (async () => {
+  let chainConfigs = {};
   try {
     const cfgResp = await fetch(`config.json?t=${Date.now()}`);
     if (cfgResp.ok) {
@@ -285,13 +299,14 @@ function applyFilter() {
         if (typeof cfg.position.capital_usd === "number") CAP = cfg.position.capital_usd;
         if (typeof cfg.position.range_pct === "number") RANGE_W = cfg.position.range_pct;
       }
+      chainConfigs = cfg.chains || {};
     }
   } catch (e) { console.warn("config.json load failed, using defaults ($10,000 / ±20%):", e.message); }
 
   const tb = document.querySelector("#tbl tbody");
   const ds = [], dl = [], dv = [];
   const active = [];
-  const llamaRef = await fetchDefiLlamaRef();
+  const llamaRef = await fetchDefiLlamaRef(chainConfigs);
 
   for (const [i, name] of CHAINS.entries()) {
     const rows = await loadCSV(name);
@@ -300,14 +315,16 @@ function applyFilter() {
     const f = dailyFees(rows);
     const a30 = sumApr(f, 30), a90 = sumApr(f, 90), all = sumApr(f, 1e9);
     const last = rows[rows.length - 1];
+    const isOther = last.asset_class === "other";
     const v30 = maKey(f, 30, "vol"), vLast = v30[v30.length - 1];
     const liqNow = parseFloat(last.liquidity);
     const turn = (vLast != null && liqNow > 0) ? (vLast / liqNow) : null;
     const color = CHAIN_COLORS[name] || "#627eea";
     const llama = llamaRef[name];
 
-    tb.insertAdjacentHTML("beforeend", `<tr data-chain="${name}">
+    tb.insertAdjacentHTML("beforeend", `<tr data-chain="${name}"${isOther ? ' class="asset-other"' : ""}>
       <td>${escapeHtml(CHAIN_LABELS[name] || name)}</td>
+      <td>${escapeHtml(last.pair || "?")}${isOther ? '<span class="ref-tag">参考</span>' : ""}</td>
       <td>${(parseInt(last.feeTier, 10) / 10000).toFixed(2)}%</td>
       <td>${a30 == null ? "—" : a30.toFixed(1) + "%"}</td>
       <td>${a90 == null ? "—" : a90.toFixed(1) + "%"}</td>
@@ -320,9 +337,11 @@ function applyFilter() {
     </tr>`);
 
     const m30 = maApr(f, 30);
-    ds.push({ label: CHAIN_LABELS[name] || name, _chain: name, data: f.map((x, j) => ({ x: x.d, y: m30[j] })), borderColor: color, borderWidth: 1.8, pointRadius: 0, tension: .2 });
-    dl.push({ label: CHAIN_LABELS[name] || name, _chain: name, data: f.map(x => ({ x: x.d, y: x.liq })), borderColor: color, borderWidth: 1.5, pointRadius: 0 });
-    dv.push({ label: CHAIN_LABELS[name] || name, _chain: name, data: f.map((x, j) => ({ x: x.d, y: v30[j] })), borderColor: color, borderWidth: 1.5, pointRadius: 0 });
+    // asset_class="other"（原資産がETHでない）は点線で視覚的に区別する
+    const lineStyle = isOther ? { borderDash: [5, 4] } : {};
+    ds.push({ label: CHAIN_LABELS[name] || name, _chain: name, data: f.map((x, j) => ({ x: x.d, y: m30[j] })), borderColor: color, borderWidth: 1.8, pointRadius: 0, tension: .2, ...lineStyle });
+    dl.push({ label: CHAIN_LABELS[name] || name, _chain: name, data: f.map(x => ({ x: x.d, y: x.liq })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
+    dv.push({ label: CHAIN_LABELS[name] || name, _chain: name, data: f.map((x, j) => ({ x: x.d, y: v30[j] })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
   }
 
   renderFilterButtons(active);

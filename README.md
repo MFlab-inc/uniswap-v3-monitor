@@ -1,8 +1,12 @@
 # Uniswap V3 LP 収益力モニター
 
 Ethereum / Optimism / Base / Arbitrum / BNB Smart Chain / Unichain の Uniswap V3
-ETH/USDC プールから、毎日 `slot0` / `liquidity` / `feeGrowthGlobal` をオンチェーンで
-取得し、**単位流動性あたりの手数料（プール規模に依存しない収益力）** を比較する。
+プールから、毎日 `slot0` / `liquidity` / `feeGrowthGlobal` をオンチェーンで取得し、
+**単位流動性あたりの手数料（プール規模に依存しない収益力）** を比較する。
+
+対象は基本的に ETH/USDC だが、COINPOOL が実運用するプールに合わせて BNB Smart Chain
+だけは **BNB/USDT**（原資産が ETH でない参考枠）になっている（詳細は下記「対象チェーン
+とペア」）。
 
 DefiLlama 等の外部APIではなく、プールコントラクトが記録する実測値（`feeGrowthGlobal`
 の日次増分）を直接使うため、履歴が残り、任意のレンジ幅での試算ができる。
@@ -15,6 +19,27 @@ GitHub Actions（毎日 00:10 UTC = 09:10 JST）
         └ data/<chain>.csv に1行追記 → 自動 commit
 index.html（GitHub Pages）── CSV(BigInt) を読んで年率利回り・取引量・流動性を算出/表示
 ```
+
+## 対象チェーンとペア
+
+| チェーン | ペア | プールの決め方 | 資産クラス |
+|---|---|---|---|
+| Ethereum | ETH/USDC | factory 探索（全手数料ティア中、流動性最大） | eth |
+| Optimism | ETH/USDC | factory 探索（USDC ネイティブ/ブリッジ両対応） | eth |
+| Base | ETH/USDC | factory 探索 | eth |
+| Arbitrum | ETH/USDC | factory 探索（USDC ネイティブ/ブリッジ両対応） | eth |
+| BNB Smart Chain | **BNB/USDT** | **プール直接指定**（`0x6fe9E9de56356F7eDBfcBB29FAB7cd69471a4869`） | **other（参考）** |
+| Unichain | ETH/USDC | **プール直接指定**（`0x8927058918e3CFf6F55EfE45A58db1be1F069E49`） | eth |
+
+BSC と Unichain は factory 探索を行わず、`config.json` の `pool` に直接指定された
+プールを使う。`token0()`/`token1()`/`fee()`/`decimals()`/`symbol()` をそのプールに
+問い合わせて構成を自動判定する（`collect.py` の `inspect_pool()`）。
+
+**BNB/USDT は原資産が ETH ではないため、ETH系のチェーンと同列に並べて比較しては
+ならない。** 収益力（単位流動性あたりの手数料）としての比較自体は成立するが、原資産の
+ボラティリティが異なりIL特性も変わるため、「どこで ETH を運用するか」という比較には
+使えない。`config.json` の `asset_class` で `eth`/`other` を区別しており、ダッシュボード
+では `other` の行を淡色表示 + 「参考」タグ + グラフは点線で分離して表示する。
 
 ## セットアップ（初回のみ）
 
@@ -40,29 +65,49 @@ index.html（GitHub Pages）── CSV(BigInt) を読んで年率利回り・取
 `eth_call`（backfill・過去日の再取得）ができない。Alchemy / Infura / QuickNode 等の
 アーカイブ対応プランを使うこと。
 
-### 3. 設定を検証する（必須）
+### 3. 設定を検証する（必須・最初に必ず実行すること）
 ```bash
+export RPC_ETHEREUM=https://...
+export RPC_OPTIMISM=https://...
 export RPC_BASE=https://...
 export RPC_ARBITRUM=https://...
-# ...設定した分だけ
+export RPC_BSC=https://...
+export RPC_UNICHAIN=https://...
+# 設定した分だけでよい。未設定のチェーンは「環境変数が未設定 → スキップ」と出る。
 python collect.py --verify
 ```
-各チェーンについて、接続可否・factory から検出したプール・手数料ティア・
-`token0`/`token1` の decimals・現在の ETH 価格が表示される。
+
+各チェーンについて、接続可否・プール構成（factory探索 or 直接指定）・token0/token1の
+シンボルとdecimals・現在の価格が表示される。
 
 ```
-■ arbitrum
+■ arbitrum  (ETH/USDC)
   接続OK  chainId=42161  最新ブロック=xxx,xxx,xxx
   factory=0x...
      0.05%  0x...  liquidity=1.234e+18
      0.30%  0x...  liquidity=5.678e+17
-  → 採用: 0x...  手数料0.05%  WETHはtoken1  (wethDecimals=18, usdcDecimals=6)
-  → ETH価格 $2,451.74  ← 実勢と合っていれば設定は正しい
+  → 採用: 0x...  WETH/USDC  手数料0.05%
+  → 価格 2,451.744500  (ETH/USDC)  ← 実勢と合っていれば設定は正しい
+
+■ bsc  (BNB/USDT・参考枠(原資産≠ETH))
+  接続OK  chainId=56  最新ブロック=xxx,xxx,xxx
+    プール直接指定: 0x6fe9E9de56356F7eDBfcBB29FAB7cd69471a4869
+    token0=WBNB(18桁) 0x...
+    token1=USDT(18桁) 0x...
+    手数料0.05%  liquidity=...
+  → 価格 612.340000  (BNB/USDT)  ← 実勢と合っていれば設定は正しい
 ```
 
-**最後に出る ETH 価格が実勢の相場と合っているかどうかで、設定（アドレス・decimals）の
-正誤を判断できる。** 大きくずれる場合は `config.json` の `factory`/`weth`/`usdc` を
-見直す。特に `bsc` と `unichain` は未検証のため要確認（下記「未検証事項」）。
+**最後に出る価格が実勢の相場と合っているかどうかで、設定（アドレス・decimals・
+どちらが原資産か）の正誤を判断できる。** ETH系チェーンは ETH 価格、BSC は BNB 価格が
+出るはず。大きくずれる場合（特に 10^12 倍・10^18 倍のようなオーダーのズレ）は
+decimals の取り違えを疑い、`config.json` を見直す。
+
+`config.json` の `weth` フィールドは「原資産（WETH/WBNB等）のアドレス」を表し、
+`base_is_token0` の判定に使う。プール直接指定のチェーンでは、これに加えて
+`base_symbol`（例: `"WBNB"`）が設定されていれば、プールから読み取った実際の
+`symbol()` の値ともクロスチェックし、アドレスとシンボルの判定が食い違う場合は
+警告を出す（`weth` アドレスの設定ミスに気付くための二重チェック）。
 
 ### 4. GitHub Pages を有効化
 **Settings → Pages → Source: Deploy from a branch → main / (root)**
@@ -86,11 +131,23 @@ python collect.py --backfill 400            # 全チェーン、環境変数が�
 
 | | |
 |---|---|
-| `config.json` | チェーン・トークン・factory の設定、および `$10,000`/`±20%` の基準値（`position`） |
+| `config.json` | チェーン・トークン・pool/factory の設定、`asset_class`/`pair`、`$10,000`/`±20%` の基準値（`position`） |
 | `collect.py` | 収集スクリプト（日次／backfill／`--verify` 対応） |
 | `.github/workflows/collect.yml` | 毎日自動実行・自動 commit |
 | `index.html` | ダッシュボード（Chart.js のみ・ビルド不要） |
 | `data/*.csv` | 蓄積データ（`feeGrowthGlobal` は uint256 を10進文字列として保存） |
+
+### CSV の列
+
+```
+date, timestamp, block, pool, pair, asset_class, feeTier,
+base_is_token0, dec0, dec1, price, tick, sqrtPriceX96, liquidity,
+feeGrowthGlobal0X128, feeGrowthGlobal1X128
+```
+
+`base_is_token0` は原資産（ETH/BNB等）が token0 かどうか。`dec0`/`dec1` は
+token0/token1 それぞれの decimals（`pair`・チェーンにより 6 でも 18 でもあり得る）。
+`price` は原資産1単位あたりの建て通貨（USDC/USDT）建て価格。
 
 ## 指標の定義
 
@@ -103,7 +160,10 @@ python collect.py --backfill 400            # 全チェーン、環境変数が�
 と実際の取り分を過大評価する（実測で約1.6倍の乖離を確認済み）。
 
 **取引量（1日あたり）** = `feeGrowthGlobal` の増分 × アクティブ流動性 ÷ 手数料率 で
-逆算。Base の実績値（The Graph / Messari）との突合で比率1.087で一致することを検証済み。
+逆算。Base の実績値（The Graph / Messari）との突合で比率1.087で一致することを
+検証済み（この検証は本リポジトリの作成者によるオフチェーンでの事前確認であり、
+本リポジトリのコード自体は The Graph / Messari に接続して自動照合する機能を持たない。
+数式のみを実装している）。
 
 **注意**:
 - 本指標は手数料の獲得力のみを示す。IL（インパーマネントロス）・スワップコスト・
@@ -116,17 +176,36 @@ python collect.py --backfill 400            # 全チェーン、環境変数が�
 - `feeGrowthGlobal` は稀にオーバーフローで巻き戻ることがある。増分が負になった日は
   自動的にスキップされる。
 - トークンの decimals（桁数）はチェーンごとに自動検出しており、18/6桁と決め打ちして
-  いない。例えば BNB Smart Chain の USDC は 18桁であり、これをハードコードすると
-  ETH価格が10^12倍ずれる。`--verify` の ETH価格表示はこの種の設定ミスを見つけるための
-  ものでもある。
+  いない。例えば BNB Smart Chain の USDT は 18桁であり、これをハードコードすると
+  価格が桁違いにずれる。`--verify` の価格表示はこの種の設定ミスを見つけるためのもの
+  でもある。
+- BNB/USDT（BSC）は原資産が ETH ではない参考枠。ETH系チェーンとの直接比較はできない
+  （「対象チェーンとペア」参照）。
 
-## 未検証事項
+## 未検証事項・このリポジトリの検証範囲について
 
-`config.json` の `bsc` と `unichain` は factory / token アドレスを未検証。
-`collect.py` は起動時に factory から pool を検出し、`liquidity > 0` を確認するので、
-アドレスが間違っていれば「プールが見つかりません」と出る。また `--verify` が返す
-ETH 価格が実勢と大きくずれる場合も、アドレスまたは decimals の設定ミスを疑うこと。
-その場合は `config.json` を修正する。
+**重要: 本リポジトリのコードはオフラインで検証されており、実チェーンへの接続は
+未検証。** 実装環境にブロックチェーンRPCへのアウトバウンドネットワークアクセスが
+無かったため、`python collect.py --verify` を実際のRPCに対して実行して結果を確認する
+ことができなかった。代わりに以下の方法で検証した:
+
+- 実RPCの代わりにモックRPCを使い、`find_pool`/`inspect_pool`/`snapshot`/`block_at`/
+  `resolve_base_is_token0`/backfillの重複排除ロジックを、標準的な18/6桁・BSCのような
+  18/18桁・BNB/USDTの直接指定シナリオ（`base_is_token0`のアドレス判定とsymbol判定が
+  食い違うケースを含む）で検証した。
+- ダッシュボードの計算式（`amounts`/`value`/`dailyFees`等）を実際の `data/base.csv`
+  （888日分）に対して実行し、有限・非負・妥当な桁感の値が出ることを確認した。
+- Chart.js を使わない静的レンダリングで、テーブル・フィルターUI・`asset_class=other`
+  の視覚的区別が正しく動作することを確認した。
+
+**したがって、初回セットアップ時に必ず `python collect.py --verify` を実RPCで
+実行し、以下を確認すること:**
+1. 全6チェーンについて出力が得られるか（未設定のものは「スキップ」でよい）
+2. ETH系チェーンの価格が実勢のETH価格と合っているか
+3. **BSC の価格が実勢のBNB価格（数百ドル程度のオーダー）と合っているか** — 大きく
+   ずれる場合は `config.json` の `bsc.weth`（WBNBアドレス）が誤っている可能性が高い
+4. Unichain の `liquidity` が明らかに0でないか（0の場合「流動性が0」の警告が出る）
+5. アドレス判定とsymbol判定の食い違い警告が出ていないか
 
 USDC のネイティブ版／ブリッジ版（USDC.e など）が併存するチェーンについては、
 `usdc` を配列にすることで両方を候補として登録でき、`collect.py` が自動的に
@@ -139,4 +218,5 @@ USDC のネイティブ版／ブリッジ版（USDC.e など）が併存する�
 - 秘匿情報（RPC URL・APIキー）はリポジトリに含めない。GitHub Secrets を使う。
 - RPC 未設定のチェーンはスキップし、他チェーンの収集は継続する。
 - プールが存在しない、または `liquidity` が 0 のチェーンではエラーで落とさず
-  「プールが見つかりません」として当該チェーンのみスキップする。
+  「プールが見つかりません」（factory探索時）または「流動性が0」の警告
+  （プール直接指定時）として報告し、当該チェーンのみスキップまたは警告付きで継続する。

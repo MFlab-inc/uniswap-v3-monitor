@@ -1,5 +1,5 @@
 {
-  "_comment": "usdc は配列可。複数候補のうち最も流動性の大きいプールを自動選択する。python collect.py --verify で検証。",
+  "_comment": "pool を直接指定した場合は factory 探索をスキップし、そのプールの token0/token1/fee/decimals/symbol を問い合わせて構成を自動判定する。指定が無ければ factory から weth/usdc の全ティアを探索し流動性最大のプールを採用する。asset_class: 'eth' は原資産がETHのチェーン（相互比較の対象）、'other' は原資産がETHでない参考枠（例: BNB Smart ChainのBNB/USDT）で、ダッシュボード上もETH系とは分離して表示する。base_symbol はプール直接指定時、weth アドレスとの一致に加えて symbol() による独立クロスチェックを行うための任意設定（食い違えば警告を出す）。",
   "position": {
     "capital_usd": 10000,
     "range_pct": 0.2
@@ -10,7 +10,9 @@
       "factory": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
       "weth": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
       "usdc": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-      "block_sec": 12
+      "block_sec": 12,
+      "asset_class": "eth",
+      "pair": "ETH/USDC"
     },
     "optimism": {
       "rpc_env": "RPC_OPTIMISM",
@@ -20,14 +22,18 @@
         "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
         "0x7F5c764cBc14f9669B88837ca1490cCa17c31607"
       ],
-      "block_sec": 2
+      "block_sec": 2,
+      "asset_class": "eth",
+      "pair": "ETH/USDC"
     },
     "base": {
       "rpc_env": "RPC_BASE",
       "factory": "0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
       "weth": "0x4200000000000000000000000000000000000006",
       "usdc": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-      "block_sec": 2
+      "block_sec": 2,
+      "asset_class": "eth",
+      "pair": "ETH/USDC"
     },
     "arbitrum": {
       "rpc_env": "RPC_ARBITRUM",
@@ -37,25 +43,29 @@
         "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
         "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"
       ],
-      "block_sec": 0.25
+      "block_sec": 0.25,
+      "asset_class": "eth",
+      "pair": "ETH/USDC"
     },
     "bsc": {
       "rpc_env": "RPC_BSC",
-      "factory": "0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7",
-      "weth": "0x2170Ed0880ac9A755fd29B2688956BD959F933F8",
-      "usdc": [
-        "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"
-      ],
+      "pool": "0x6fe9E9de56356F7eDBfcBB29FAB7cd69471a4869",
+      "weth": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+      "base_symbol": "WBNB",
       "block_sec": 3,
-      "_note": "factory/token は未検証。起動時の検証結果を確認すること"
+      "asset_class": "other",
+      "pair": "BNB/USDT",
+      "_note": "COINPOOLが自動運用に対応するプールを直接指定（factory探索は行わない）。原資産がETHではないためダッシュボード上は参考枠として分離表示する。weth欄はWBNB(Wrapped BNB)のアドレス — factory探索は使わないがbase_is_token0判定に使う。--verify実行時に表示されるBNB価格が実勢と合っているか、必ず確認すること。"
     },
     "unichain": {
       "rpc_env": "RPC_UNICHAIN",
-      "factory": "0x1F98400000000000000000000000000000000003",
+      "pool": "0x8927058918e3CFf6F55EfE45A58db1be1F069E49",
       "weth": "0x4200000000000000000000000000000000000006",
-      "usdc": "0x078D782b760474a361dDA0AF3839290b0EF57AD6",
+      "base_symbol": "WETH",
       "block_sec": 1,
-      "_note": "factory/token は未検証。起動時の検証結果を確認すること"
+      "asset_class": "eth",
+      "pair": "ETH/USDC",
+      "_note": "COINPOOLが自動運用に対応するプールを直接指定（factory探索は行わない）。--verify実行時に表示されるETH価格が実勢と合っているか、必ず確認すること。"
     }
   }
 }

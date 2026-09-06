@@ -2,8 +2,8 @@
 """
 Uniswap V3 LP 収益力モニター  ── collect.py
 ================================================
-各チェーンのプールから slot0 / liquidity / feeGrowthGlobal / トークン decimals を取得し、
-data/<chain>.csv に追記する。
+各チェーンのプールから slot0 / liquidity / feeGrowthGlobal / トークン decimals・symbol を
+取得し、data/<chain>.csv に追記する。
 
   日次収集（GitHub Actions が毎日実行）:
       python collect.py
@@ -17,6 +17,14 @@ data/<chain>.csv に追記する。
 
 RPC URL は環境変数から読む（config.json の rpc_env 参照）。
 未設定のチェーンは自動でスキップし、他のチェーンの処理は継続する。
+
+プールの決め方は2通り:
+  - config.json に "pool" が無いチェーン: factory から weth/usdc の全手数料ティアを
+    探索し、流動性最大のプールを自動選択する（find_pool）。
+  - "pool" が指定されているチェーン（bsc, unichain）: そのプールを直接使い、
+    token0/token1/fee/decimals/symbol をプール自身に問い合わせて構成を判定する
+    （inspect_pool）。COINPOOL が実際に運用するプールが ETH/USDC とは限らない
+    （例: BNB Smart Chain は BNB/USDT）ため、factory 探索をスキップする。
 
 注意:
   - RPC はアーカイブノードが必要（過去ブロックの eth_call を行うため）。
@@ -37,7 +45,10 @@ SEL = {
     "fg0": "0xf3058399",
     "fg1": "0x46141319",
     "token0": "0x0dfe1681",
+    "token1": "0xd21220a7",
+    "fee": "0xddca3f43",
     "decimals": "0x313ce567",
+    "symbol": "0x95d89b41",
 }
 FEE_TIERS = (100, 500, 3000, 10000)
 
@@ -82,8 +93,32 @@ def s256(h):
     return v - 2 ** 256 if v >= 2 ** 255 else v
 
 
-def read_decimals(rpc, token):
-    return int(rpc.eth_call(token, SEL["decimals"]), 16)
+def token_meta(rpc, addr):
+    """トークンの小数桁とシンボルを取得する。symbol() は string(動的) と bytes32(旧規格) の
+    両方の ABI エンコーディングがあり得るため両対応する。取得できなければ "?" とする。"""
+    dec = int(rpc.eth_call(addr, SEL["decimals"]), 16)
+    try:
+        raw = rpc.eth_call(addr, SEL["symbol"])[2:]
+        if len(raw) > 128:                       # 動的 string（offset 32byte + length 32byte + data）
+            ln = int(raw[64:128], 16)
+            sym = bytes.fromhex(raw[128:128 + ln * 2]).decode("utf-8", "replace")
+        else:                                    # bytes32 固定長（例: 旧式トークン）
+            sym = bytes.fromhex(raw).rstrip(b"\x00").decode("utf-8", "replace")
+    except Exception:
+        sym = "?"
+    return dec, sym
+
+
+def inspect_pool(rpc, addr):
+    """プールから token0/token1・小数桁・symbol・手数料ティア・現在の流動性を読み取る"""
+    t0 = "0x" + rpc.eth_call(addr, SEL["token0"])[-40:]
+    t1 = "0x" + rpc.eth_call(addr, SEL["token1"])[-40:]
+    fee = int(rpc.eth_call(addr, SEL["fee"]), 16)
+    d0, s0 = token_meta(rpc, t0)
+    d1, s1 = token_meta(rpc, t1)
+    liq = int(rpc.eth_call(addr, SEL["liquidity"]), 16)
+    return {"pool": addr, "token0": t0, "token1": t1, "fee": fee,
+            "d0": d0, "d1": d1, "sym0": s0, "sym1": s1, "liquidity": liq}
 
 
 def find_pool(rpc, c, verbose=False):
@@ -109,27 +144,54 @@ def find_pool(rpc, c, verbose=False):
     liq, fee, addr, usdc = best
     c["usdc"] = usdc
     t0 = "0x" + rpc.eth_call(addr, SEL["token0"])[-40:]
-    weth_is_token0 = t0.lower() == c["weth"].lower()
-    weth_dec = read_decimals(rpc, c["weth"])
-    usdc_dec = read_decimals(rpc, usdc)
-    return addr, fee, weth_is_token0, weth_dec, usdc_dec
+    base_is_token0 = t0.lower() == c["weth"].lower()
+    return addr, fee, base_is_token0
 
 
-def snapshot(rpc, pool, weth_is_token0, weth_dec, usdc_dec, blk):
+def resolve_base_is_token0(c, m):
+    """token0 が「原資産」(WETH/WBNB 等) かどうかを判定する。
+
+    まず config.json の "weth" アドレスとの一致で判定し、"base_symbol" が設定されて
+    いれば symbol() の値でも独立にクロスチェックする。両者が食い違う場合は設定ミスの
+    可能性が高いため警告する（例: このチェーンの原資産アドレスの設定が古い/誤っている）。
+    """
+    by_addr = None
+    if c.get("weth"):
+        by_addr = m["token0"].lower() == c["weth"].lower()
+    by_symbol = None
+    hint = c.get("base_symbol")
+    if hint:
+        s0, s1 = m["sym0"].upper(), m["sym1"].upper()
+        if s0 == hint.upper():
+            by_symbol = True
+        elif s1 == hint.upper():
+            by_symbol = False
+    warn = None
+    if by_addr is not None and by_symbol is not None and by_addr != by_symbol:
+        warn = (f"⚠ アドレス判定(base_is_token0={by_addr})とsymbol判定(base_is_token0={by_symbol})が食い違う。"
+                f"token0={m['sym0']} token1={m['sym1']} — config.json の weth/base_symbol を確認すること")
+    result = by_symbol if by_symbol is not None else by_addr
+    if result is None:
+        warn = warn or "⚠ 原資産(token0/token1のどちらか)を判定できません。config.json に weth か base_symbol を設定してください"
+        result = True  # 便宜上の既定値。warn を必ず表示するので気付ける。
+    return result, warn
+
+
+def snapshot(rpc, pool, d0, d1, base_is_token0, blk):
+    """base_is_token0: 原資産(ETH/BNB等)が token0 か。price は「原資産1単位あたりの建て通貨量」"""
     raw = rpc.eth_call(pool, SEL["slot0"], blk)[2:]
     sq = int(raw[0:64], 16)
     tick = s256(raw[64:128])
     # sqrtPriceX96 は token1/token0 の「生の（decimals未調整）」価格の平方根。
-    # 人間可読の価格 = (sqrtP/2^96)^2 × 10^(token0decimals - token1decimals)。
-    # token0=WETH ならこれがそのまま ETH の USD 価格、token1=WETH なら逆数を取る。
-    # (WETH/USDC が常に 18/6 桁とは限らない。例: BNB Smart Chain の USDC は 18桁)
-    t0dec, t1dec = (weth_dec, usdc_dec) if weth_is_token0 else (usdc_dec, weth_dec)
+    # 人間可読の価格 = (sqrtP/2^96)^2 × 10^(dec0-dec1)。token0が原資産ならそのまま、
+    # token1が原資産なら逆数を取る。(原資産/建て通貨が常に18/6桁とは限らない。
+    # 例: BNB Smart Chain の USDC は18桁)
     p_raw = (sq / Q96) ** 2
-    p_human = p_raw * (10 ** (t0dec - t1dec))
-    px = p_human if weth_is_token0 else (1 / p_human if p_human else 0.0)
+    p = p_raw * (10 ** (d0 - d1))
+    px = p if base_is_token0 else (1 / p if p else 0.0)
     return {
         "block": blk,
-        "eth_usd": round(px, 4), "tick": tick, "sqrtPriceX96": sq,
+        "price": round(px, 6), "tick": tick, "sqrtPriceX96": sq,
         "liquidity": int(rpc.eth_call(pool, SEL["liquidity"], blk), 16),
         "feeGrowthGlobal0X128": int(rpc.eth_call(pool, SEL["fg0"], blk), 16),
         "feeGrowthGlobal1X128": int(rpc.eth_call(pool, SEL["fg1"], blk), 16),
@@ -157,8 +219,8 @@ def block_at(rpc, ts, lo, hi, block_sec):
     return b
 
 
-COLS = ["date", "timestamp", "block", "pool", "feeTier", "weth_is_token0",
-        "wethDecimals", "usdcDecimals", "eth_usd", "tick",
+COLS = ["date", "timestamp", "block", "pool", "pair", "asset_class", "feeTier",
+        "base_is_token0", "dec0", "dec1", "price", "tick",
         "sqrtPriceX96", "liquidity", "feeGrowthGlobal0X128", "feeGrowthGlobal1X128"]
 
 
@@ -166,10 +228,12 @@ def load_csv(path):
     if not os.path.exists(path):
         return []
     rows = list(csv.DictReader(open(path, encoding="utf-8")))
-    # 旧スキーマ（decimals列が無い）のCSVとの後方互換: WETH=18桁, USDC=6桁 と仮定する。
+    # 後方互換のための既定値（decimals/pair/asset_class列の無い旧スキーマのCSV対策）
     for r in rows:
-        r.setdefault("wethDecimals", "18")
-        r.setdefault("usdcDecimals", "6")
+        r.setdefault("dec0", "18")
+        r.setdefault("dec1", "6")
+        r.setdefault("pair", "?")
+        r.setdefault("asset_class", "eth")
     return rows
 
 
@@ -185,6 +249,32 @@ def save_csv(path, rows):
     return len(rows)
 
 
+def locate(rpc, name, c, verbose=False):
+    """設定からプール構成を決定する。"pool" が指定されていれば直接使い（factory 探索なし）、
+    無ければ factory から探索する。戻り値: (pool, fee, base_is_token0, d0, d1, warn|None)"""
+    if c.get("pool"):
+        m = inspect_pool(rpc, c["pool"])
+        base0, warn = resolve_base_is_token0(c, m)
+        if verbose:
+            print(f"    プール直接指定: {c['pool']}")
+            print(f"    token0={m['sym0']}({m['d0']}桁) {m['token0']}")
+            print(f"    token1={m['sym1']}({m['d1']}桁) {m['token1']}")
+            print(f"    手数料{m['fee']/10000:.2f}%  liquidity={m['liquidity']:.3e}")
+        if m["liquidity"] == 0:
+            w2 = "⚠ 流動性が0。運用対象になっていない可能性がある"
+            warn = (warn + " / " + w2) if warn else w2
+        return m["pool"], m["fee"], base0, m["d0"], m["d1"], warn
+    else:
+        pool, fee, base0 = find_pool(rpc, c, verbose=verbose)
+        m = inspect_pool(rpc, pool)
+        warn = None
+        if m["liquidity"] == 0:
+            warn = "⚠ 流動性が0。運用対象になっていない可能性がある"
+        if verbose:
+            print(f"    → 採用: {pool}  {m['sym0']}/{m['sym1']}  手数料{fee/10000:.2f}%")
+        return pool, fee, base0, m["d0"], m["d1"], warn
+
+
 def run_chain(name, c, backfill_days=0):
     url = os.environ.get(c["rpc_env"], "")
     if not url:
@@ -192,12 +282,14 @@ def run_chain(name, c, backfill_days=0):
         return
     rpc = RPC(url)
     try:
-        pool, fee, w0, weth_dec, usdc_dec = find_pool(rpc, c)
+        pool, fee, base0, d0, d1, warn = locate(rpc, name, c)
     except Exception as e:
         print(f"[{name}] プール検出失敗: {e}")
         return
-    print(f"[{name}] pool={pool} fee={fee/10000:.2f}% weth_is_token0={w0} "
-          f"wethDecimals={weth_dec} usdcDecimals={usdc_dec}")
+    print(f"[{name}] pool={pool} pair={c.get('pair','?')} fee={fee/10000:.2f}% base_is_token0={base0} "
+          f"dec0={d0} dec1={d1}")
+    if warn:
+        print(f"  {warn}")
 
     path = f"data/{name}.csv"
     rows = load_csv(path)
@@ -220,12 +312,13 @@ def run_chain(name, c, backfill_days=0):
         try:
             blk = latest if not backfill_days else block_at(rpc, ts, cur, latest, c["block_sec"])
             cur = blk
-            s = snapshot(rpc, pool, w0, weth_dec, usdc_dec, blk)
-            rows.append({"date": ds, "timestamp": ts, "pool": pool, "feeTier": fee,
-                         "weth_is_token0": w0, "wethDecimals": weth_dec, "usdcDecimals": usdc_dec, **s})
+            s = snapshot(rpc, pool, d0, d1, base0, blk)
+            rows.append({"date": ds, "timestamp": ts, "pool": pool, "pair": c.get("pair", "?"),
+                         "asset_class": c.get("asset_class", "eth"), "feeTier": fee,
+                         "base_is_token0": base0, "dec0": d0, "dec1": d1, **s})
             added += 1
             if added % 30 == 0:
-                print(f"  {ds}  ETH ${s['eth_usd']:,.2f}  liq={s['liquidity']:.3e}")
+                print(f"  {ds}  価格 {s['price']:,.4f}  liq={s['liquidity']:.3e}")
         except Exception as e:
             print(f"  ! {ds}: {e}")
     n = save_csv(path, rows)
@@ -233,13 +326,14 @@ def run_chain(name, c, backfill_days=0):
 
 
 def verify():
-    """各チェーンの factory / token アドレスが正しいかを実際に問い合わせて確認する"""
+    """各チェーンの factory/pool・token アドレスが正しいかを実際に問い合わせて確認する"""
     print("=" * 78)
     print("アドレス検証  （python collect.py --verify）")
     print("=" * 78)
     for name, c in CFG["chains"].items():
         url = os.environ.get(c["rpc_env"], "")
-        print(f"\n■ {name}")
+        print(f"\n■ {name}  ({c.get('pair', '?')}"
+              f"{'・参考枠(原資産≠ETH)' if c.get('asset_class') == 'other' else ''})")
         if not url:
             print(f"  環境変数 {c['rpc_env']} が未設定 → スキップ")
             continue
@@ -251,13 +345,14 @@ def verify():
         except Exception as e:
             print(f"  接続失敗: {e}")
             continue
-        print(f"  factory={c['factory']}")
+        if not c.get("pool"):
+            print(f"  factory={c['factory']}")
         try:
-            pool, fee, w0, weth_dec, usdc_dec = find_pool(rpc, c, verbose=True)
-            print(f"  → 採用: {pool}  手数料{fee/10000:.2f}%  WETHはtoken{'0' if w0 else '1'}"
-                  f"  (wethDecimals={weth_dec}, usdcDecimals={usdc_dec})")
-            s = snapshot(rpc, pool, w0, weth_dec, usdc_dec, "latest")
-            print(f"  → ETH価格 ${s['eth_usd']:,.2f}  ← 実勢と合っていれば設定は正しい")
+            pool, fee, base0, d0, d1, warn = locate(rpc, name, c, verbose=True)
+            if warn:
+                print(f"    {warn}")
+            s = snapshot(rpc, pool, d0, d1, base0, "latest")
+            print(f"  → 価格 {s['price']:,.4f}  ({c.get('pair', '?')})  ← 実勢と合っていれば設定は正しい")
         except Exception as e:
             print(f"  × {e}")
     print("\n" + "=" * 78)
