@@ -5,8 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Uniswap V3 LP 収益力モニター</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/date-fns/3.6.0/cdn.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-adapter-date-fns/3.0.0/chartjs-adapter-date-fns.bundle.min.js"></script>
 <style>
 :root{--ink:#15191d;--ink3:#78838c;--rule:#d5dbdf;--cp:#1a4d6d;--accent:#0891b2}
 *{box-sizing:border-box}
@@ -396,10 +394,11 @@ function applyFilter() {
     // asset_class="other"（原資産がETHでない）は点線で視覚的に区別する
     const lineStyle = isOther ? { borderDash: [5, 4] } : {};
     const dsMeta = { _chain: name, _pair: pair, _fee: feeTier };
-    // x は Date オブジェクトにする（文字列のままだと time スケールが解釈できない）
-    ds.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map((x, j) => ({ x: new Date(x.d), y: m30[j] })), borderColor: color, borderWidth: 1.8, pointRadius: 0, tension: .2, ...lineStyle });
-    dl.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map(x => ({ x: new Date(x.d), y: x.liq })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
-    dv.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map((x, j) => ({ x: new Date(x.d), y: v30[j] })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
+    // x はエポックミリ秒(数値)にする。linear スケールで扱うため Date オブジェクトではなく
+    // 数値が必要（date アダプタに依存しない — 理由は下の opt 定義のコメント参照）。
+    ds.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map((x, j) => ({ x: new Date(x.d).getTime(), y: m30[j] })), borderColor: color, borderWidth: 1.8, pointRadius: 0, tension: .2, ...lineStyle });
+    dl.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map(x => ({ x: new Date(x.d).getTime(), y: x.liq })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
+    dv.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map((x, j) => ({ x: new Date(x.d).getTime(), y: v30[j] })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
   }
 
   renderFilterButtons(rowsMeta);
@@ -408,19 +407,29 @@ function applyFilter() {
     document.getElementById("msg").textContent = "data/ にCSVがありません。collect.py --backfill を実行してデータを用意してください。";
     return;
   }
-  // x軸は type:"time" にする。type:"category" だと日付は単なる文字列ラベルとして
-  // 扱われ、時系列にソートされない — データ期間の異なる系列(例: Baseは889日、他は
-  // 400日等)を重ねると、共通ラベルが尽きた時点で片方の残りの日付がそのまま末尾に
-  // 連結され、X軸が時系列の途中で過去に巻き戻る不具合が発生する(実際にChart.js
-  // 4.4.1で確認済み)。time スケールなら日付の実際の値でソート・補間されるため、
-  // 系列ごとに期間が違っても正しく重なる。
-  // 注意: parsing:false は指定しない。parsing:false + {x,y}オブジェクト形式の
-  // データを組み合わせると、Chart.js が軸の値域を正しく構築できずほぼ全ての点が
-  // 描画範囲外に押し出される不具合が別途あるため(実際にChart.js 4.4.1で確認済み)。
+  // x軸は type:"linear" にし、x値にはエポックミリ秒を渡す。
+  //
+  // type:"category" だと日付は単なる文字列ラベルとして扱われ、時系列にソートされない
+  // — データ期間の異なる系列(例: Baseは889日、他は400日等)を重ねると、共通ラベルが
+  // 尽きた時点で片方の残りの日付がそのまま末尾に連結され、X軸が時系列の途中で過去に
+  // 巻き戻る不具合が発生する(実際にChart.js 4.4.1で確認済み)。
+  //
+  // type:"time" + 日付アダプタ(chartjs-adapter-date-fns等)で解決できるが、これは
+  // Chart.js本体に加えて2つの追加CDN(date-fns本体・アダプタ)の読み込み順序・
+  // 可用性に依存する。実際にGitHub Pages上で "This method is not implemented:
+  // Check that a complete date adapter is provided" という実行時エラーが発生し、
+  // 3グラフとも描画されなくなることを確認した(このサンドボックス環境は
+  // cdnjs.cloudflare.com への外部接続がそもそもできないため、ローカルにCDNと同一
+  // バージョンのファイルを配置したテストでは、この種のCDN到達性/読み込み順の問題を
+  // 検出できなかった)。そのため date アダプタには依存せず、Chart.js本体のみで
+  // 完結する type:"linear" + 数値(エポックミリ秒)を採用する。目盛りラベルと
+  // ツールチップ見出しは自前でフォーマットする。
+  const fmtMonth = v => { const d = new Date(v); return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0"); };
+  const fmtDate = v => { const d = new Date(v); return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); };
   const opt = {
     responsive: true,
-    scales: { x: { type: "time", time: { unit: "month", tooltipFormat: "yyyy-MM-dd" }, ticks: { maxTicksLimit: 10 } } },
-    plugins: { legend: { position: "bottom" } },
+    scales: { x: { type: "linear", ticks: { maxTicksLimit: 10, callback: fmtMonth } } },
+    plugins: { legend: { position: "bottom" }, tooltip: { callbacks: { title: items => (items.length ? fmtDate(items[0].parsed.x) : "") } } },
   };
   chartInstances.ch = new Chart(document.getElementById("ch"), { type: "line", data: { datasets: ds }, options: { ...opt, scales: { ...opt.scales, y: { title: { display: true, text: "年率手数料利回り %" } } } } });
   chartInstances.vol = new Chart(document.getElementById("vol"), { type: "line", data: { datasets: dv }, options: { ...opt, scales: { ...opt.scales, y: { type: "logarithmic", title: { display: true, text: "1日あたり取引量 USD" } } } } });
