@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Uniswap V3 LP 収益力モニター</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/date-fns/3.6.0/cdn.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-adapter-date-fns/3.0.0/chartjs-adapter-date-fns.bundle.min.js"></script>
 <style>
 :root{--ink:#15191d;--ink3:#78838c;--rule:#d5dbdf;--cp:#1a4d6d;--accent:#0891b2}
 *{box-sizing:border-box}
@@ -394,9 +396,10 @@ function applyFilter() {
     // asset_class="other"（原資産がETHでない）は点線で視覚的に区別する
     const lineStyle = isOther ? { borderDash: [5, 4] } : {};
     const dsMeta = { _chain: name, _pair: pair, _fee: feeTier };
-    ds.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map((x, j) => ({ x: x.d, y: m30[j] })), borderColor: color, borderWidth: 1.8, pointRadius: 0, tension: .2, ...lineStyle });
-    dl.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map(x => ({ x: x.d, y: x.liq })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
-    dv.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map((x, j) => ({ x: x.d, y: v30[j] })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
+    // x は Date オブジェクトにする（文字列のままだと time スケールが解釈できない）
+    ds.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map((x, j) => ({ x: new Date(x.d), y: m30[j] })), borderColor: color, borderWidth: 1.8, pointRadius: 0, tension: .2, ...lineStyle });
+    dl.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map(x => ({ x: new Date(x.d), y: x.liq })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
+    dv.push({ label: CHAIN_LABELS[name] || name, ...dsMeta, data: f.map((x, j) => ({ x: new Date(x.d), y: v30[j] })), borderColor: color, borderWidth: 1.5, pointRadius: 0, ...lineStyle });
   }
 
   renderFilterButtons(rowsMeta);
@@ -405,10 +408,20 @@ function applyFilter() {
     document.getElementById("msg").textContent = "data/ にCSVがありません。collect.py --backfill を実行してデータを用意してください。";
     return;
   }
-  // 注意: parsing:false は指定しない。category スケール + {x,y}オブジェクト形式の
-  // データで parsing:false を指定すると、Chart.js が軸ラベル/目盛りを構築できず
-  // ほぼ全ての点が描画範囲外に押し出される(実際にChart.js 4.4.1で確認済みの不具合)。
-  const opt = { responsive: true, scales: { x: { type: "category", ticks: { maxTicksLimit: 10 } } }, plugins: { legend: { position: "bottom" } } };
+  // x軸は type:"time" にする。type:"category" だと日付は単なる文字列ラベルとして
+  // 扱われ、時系列にソートされない — データ期間の異なる系列(例: Baseは889日、他は
+  // 400日等)を重ねると、共通ラベルが尽きた時点で片方の残りの日付がそのまま末尾に
+  // 連結され、X軸が時系列の途中で過去に巻き戻る不具合が発生する(実際にChart.js
+  // 4.4.1で確認済み)。time スケールなら日付の実際の値でソート・補間されるため、
+  // 系列ごとに期間が違っても正しく重なる。
+  // 注意: parsing:false は指定しない。parsing:false + {x,y}オブジェクト形式の
+  // データを組み合わせると、Chart.js が軸の値域を正しく構築できずほぼ全ての点が
+  // 描画範囲外に押し出される不具合が別途あるため(実際にChart.js 4.4.1で確認済み)。
+  const opt = {
+    responsive: true,
+    scales: { x: { type: "time", time: { unit: "month", tooltipFormat: "yyyy-MM-dd" }, ticks: { maxTicksLimit: 10 } } },
+    plugins: { legend: { position: "bottom" } },
+  };
   chartInstances.ch = new Chart(document.getElementById("ch"), { type: "line", data: { datasets: ds }, options: { ...opt, scales: { ...opt.scales, y: { title: { display: true, text: "年率手数料利回り %" } } } } });
   chartInstances.vol = new Chart(document.getElementById("vol"), { type: "line", data: { datasets: dv }, options: { ...opt, scales: { ...opt.scales, y: { type: "logarithmic", title: { display: true, text: "1日あたり取引量 USD" } } } } });
   chartInstances.liq = new Chart(document.getElementById("liq"), { type: "line", data: { datasets: dl }, options: { ...opt, scales: { ...opt.scales, y: { type: "logarithmic" } } } });
