@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Uniswap V3 LP 収益力モニター</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root{--ink:#15191d;--ink3:#78838c;--rule:#d5dbdf;--cp:#1a4d6d;--accent:#0891b2}
+*{box-sizing:border-box}
+body{margin:0;font-family:"Hiragino Sans","Yu Gothic Medium","Noto Sans JP",system-ui,sans-serif;color:var(--ink);background:#f4f6f8;font-size:15px;line-height:1.7}
+.wrap{max-width:1080px;margin:0 auto;padding:28px 20px 60px}
+h1{font-size:22px;margin:0 0 4px;color:var(--cp)}
+.sub{font-size:13px;color:var(--ink3);margin-bottom:20px}
+.card{background:#fff;border:1px solid var(--rule);padding:18px;margin-bottom:20px}
+.card h2{font-size:15px;margin:0 0 12px;color:var(--cp)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:8px 10px;text-align:right;border-bottom:1px solid #eceff1;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+thead th{background:#eaf0f4;color:var(--cp);font-size:12px}
+tbody tr.filtered-out{display:none}
+.note{font-size:12px;color:var(--ink3);margin-top:10px;line-height:1.6}
+.note b{color:var(--ink)}
+canvas{max-height:360px}
+.err{color:#a8382c;font-size:13px}
+.tbl-wrap{overflow-x:auto}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+.filter-btn{border:1px solid var(--rule);background:#fff;color:var(--ink3);padding:6px 13px;font-size:12.5px;border-radius:4px;cursor:pointer;font-family:inherit}
+.filter-btn:hover{border-color:var(--cp);color:var(--cp)}
+.filter-btn.active{background:var(--cp);border-color:var(--cp);color:#fff}
+.gecko-tag{display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:3px;background:#ecfdf5;color:#059669;border:1px solid #a7f3d0;margin-left:4px}
+.tools-section{margin-top:8px}
+.tools-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+.tool-card{background:#fbfcfd;border:1px solid var(--rule);border-radius:6px;padding:14px;text-decoration:none;color:var(--ink);display:flex;flex-direction:column;gap:6px;transition:border-color .15s}
+.tool-card:hover{border-color:var(--cp)}
+.tool-name{font-size:13.5px;font-weight:600;color:var(--accent)}
+.tool-desc{font-size:11.5px;color:var(--ink3);line-height:1.55}
+footer{margin-top:8px;padding-top:14px;border-top:1px solid var(--rule);font-size:11px;color:var(--ink3);text-align:center;line-height:1.7}
+footer a{color:var(--ink3)}
+@media (max-width:640px){.wrap{padding:16px}}
+</style>
+</head>
+<body><div class="wrap">
+<h1>Uniswap V3 LP 収益力モニター</h1>
+<div class="sub">$10,000 を時価±20% レンジで提供した場合の年率手数料利回り。オンチェーンの <code>feeGrowthGlobal</code> 実測値から算出した、<b>プールの規模に依存しない、単位流動性あたりの収益力</b>で比較する。</div>
+
+<div class="filters" id="chain-filters"></div>
+
+<div class="card">
+  <h2>直近の収益力（年率換算）</h2>
+  <div class="tbl-wrap">
+  <table id="tbl"><thead><tr>
+    <th>チェーン</th><th>手数料ティア</th><th>直近30日</th><th>直近90日</th><th>全期間</th>
+    <th>参考: DefiLlama<br>(フルレンジ)</th>
+    <th>取引量/日<br>(30日平均)</th><th>流動性<br>（現在）</th><th>回転率<br>(量÷流動性)</th><th>日数</th>
+  </tr></thead><tbody></tbody></table>
+  </div>
+  <div class="note">年率利回り = 30/90日間・全期間の手数料合計 ÷ $10,000 × 365/日数。<b>TVLではなく feeGrowthGlobal（流動性1単位あたりの手数料累積値）の実測増分</b>を使用しており、レンジ外で手数料を受け取れない流動性を含む按分より正確。「参考: DefiLlama」列は算出方法が異なる外部値（フルレンジAPR）であり、本指標とは一致しない。取得できないチェーンは「—」。</div>
+</div>
+
+<div class="card">
+  <h2>収益力の推移（30日移動平均・年率）</h2>
+  <canvas id="ch"></canvas>
+</div>
+
+<div class="card">
+  <h2>取引量の推移（30日移動平均・対数）</h2>
+  <canvas id="vol"></canvas>
+  <div class="note">取引量 = feeGrowthGlobal の増分 × アクティブ流動性 ÷ 手数料率 で逆算。Base の実績値（The Graph / Messari）との突合で比率1.087で一致することを検証済み。</div>
+</div>
+
+<div class="card">
+  <h2>アクティブ流動性の推移（対数）</h2>
+  <canvas id="liq"></canvas>
+  <div class="note"><b>収益力が落ちたとき、上の「取引量」と下の「流動性」のどちらが原因かを見る。</b>取引量が伸び悩む一方で流動性だけが増えていれば、参入過多による分配比率の低下（希薄化）を意味する。</div>
+</div>
+
+<div id="msg" class="err"></div>
+
+<div class="card tools-section">
+  <h2>📐 レンジ・IL を含めたシミュレーション</h2>
+  <div class="note" style="margin-top:0 0 12px">上記の年率利回りは「時価 ±20%」を仮定した参考値であり、<b>実際の V3 運用ではレンジ設定・値動きによって数値は大きく変動する。</b>特定のレンジ幅での収益・IL（インパーマネントロス）を見るには以下の外部ツールを使うこと。</div>
+  <div class="tools-grid">
+    <a href="https://revert.finance/" target="_blank" rel="noopener noreferrer" class="tool-card">
+      <div class="tool-name">Revert Finance</div>
+      <div class="tool-desc">ポジション分析・バックテスト・自動複利。Ethereum / Base / Arbitrum 等の実ポジションを分析。</div>
+    </a>
+    <a href="https://metrix.finance/" target="_blank" rel="noopener noreferrer" class="tool-card">
+      <div class="tool-name">Metrix Finance</div>
+      <div class="tool-desc">V3・V4対応LPシミュレーター。Fee APR・IL・Net PnLを統合分析。レンジ幅を指定して試算できる。</div>
+    </a>
+    <a href="https://www.metacrypt.org/uniswap-v3-calculator-simulator/" target="_blank" rel="noopener noreferrer" class="tool-card">
+      <div class="tool-name">Metacrypt (Unispark)</div>
+      <div class="tool-desc">レンジ指定APRシミュレーション。Uniswap公式Subgraphからリアルタイムデータ取得。無料。</div>
+    </a>
+    <a href="https://qalc.ai/defi/uniswap-v3-simulator" target="_blank" rel="noopener noreferrer" class="tool-card">
+      <div class="tool-name">Qalc.ai</div>
+      <div class="tool-desc">ブラウザ完結型ストレステスト。価格変動シナリオ別のFee収入・IL・損益分岐点を試算。無料・アカウント不要。</div>
+    </a>
+  </div>
+</div>
+
+<footer>
+  データ源: 各チェーンのオンチェーン RPC（<code>feeGrowthGlobal</code> / <code>liquidity</code> / <code>slot0</code> 実測値）・毎日自動収集<br>
+  <b>この指標は手数料の獲得力のみを示す。IL（インパーマネントロス）・スワップコスト・成功報酬は含まない。実際の損益はこれらを差し引いた後の値になる。</b><br>
+  参考値: <a href="https://yields.llama.fi/pools" target="_blank">DefiLlama Yields API</a>（フルレンジ apyBase、計算方法の違いにより本指標とは一致しない）
+</footer>
+</div>
+
+<script>
+// ============================================
+// 設定
+// ============================================
+const CHAIN_LABELS = {ethereum:"Ethereum", optimism:"Optimism", base:"Base", arbitrum:"Arbitrum", bsc:"BNB Chain", unichain:"Unichain"};
+const CHAINS = Object.keys(CHAIN_LABELS);
+// $10,000 を時価±20%で提供という基準は config.json の "position" と揃える(単一の設定元にする)。
+// config.json の読み込みに失敗した場合は spec 通りの既定値 10,000 / ±20% を使う。
+let CAP = 10000, RANGE_W = 0.20;
+const CHAIN_COLORS = {ethereum:"#6366f1", optimism:"#e11d48", base:"#1a4d6d", arbitrum:"#0284c7", bsc:"#d97706", unichain:"#7c3aed"};
+
+// DefiLlama の chain 表記（"参考"列にのみ使用。取得失敗時は "—" 表示に留める）
+const DEFILLAMA_CHAIN = {ethereum:"Ethereum", optimism:"Optimism", base:"Base", arbitrum:"Arbitrum", bsc:"BSC", unichain:"Unichain"};
+
+const filters = { chain: "all" };
+let chartInstances = {};
+
+// ============================================
+// ポジション価値の計算（token0/token1 の decimals を可変に対応）
+// D0: WETH decimals, D1: USDC decimals（チェーンにより 6 でない場合がある: 例 BNB Smart Chain の USDC は 18桁）
+// ============================================
+function amounts(L, P, Pa, Pb, D0, D1) {
+  const SCALE = 10 ** (D1 - D0);
+  const sp = Math.sqrt(P * SCALE), sa = Math.sqrt(Pa * SCALE), sb = Math.sqrt(Pb * SCALE);
+  if (sp <= sa) return [L * (1 / sa - 1 / sb), 0];
+  if (sp >= sb) return [0, L * (sb - sa)];
+  return [L * (1 / sp - 1 / sb), L * (sp - sa)];
+}
+function value(L, P, Pa, Pb, D0, D1) {
+  const [a0, a1] = amounts(L, P, Pa, Pb, D0, D1);
+  return a0 / 10 ** D0 * P + a1 / 10 ** D1;
+}
+
+// ============================================
+// CSV 読み込み
+// ============================================
+async function loadCSV(name) {
+  const r = await fetch(`data/${name}.csv?t=${Date.now()}`);
+  if (!r.ok) return null;
+  const t = await r.text();
+  // CRLF/LF どちらの改行でも壊れないようにする（Python の csv モジュールは既定で
+  // "\r\n" を書き出すため、単純な split("\n") だと各行末尾の "\r" が最終列の
+  // 値に残ってしまう。feeGrowthGlobal1X128 が読めなくなり、全日が手数料算出不能になる）。
+  const lines = t.trim().split(/\r?\n/);
+  if (lines.length < 2) return null;
+  const [h, ...ls] = lines;
+  const k = h.split(",").map(s => s.trim());
+  return ls.map(l => { const v = l.split(","); const o = {}; k.forEach((kk, i) => o[kk] = (v[i] || "").trim()); return o; });
+}
+
+// ============================================
+// 日次の手数料・取引量・流動性を算出
+// ============================================
+function dailyFees(rows) {
+  const Q128 = 2n ** 128n;
+  const out = [];
+  for (let i = 1; i < rows.length; i++) {
+    const p = rows[i - 1], c = rows[i];
+    const px = parseFloat(c.eth_usd), P0 = parseFloat(p.eth_usd);
+    if (!(px > 0 && P0 > 0)) { out.push({ d: c.date, fee: null }); continue; }
+    // 旧スキーマ（decimals列なし）のCSVとの後方互換: WETH=18桁, USDC=6桁と仮定
+    const D0 = parseInt(c.wethDecimals || "18", 10);
+    const D1 = parseInt(c.usdcDecimals || "6", 10);
+    const Pa = P0 * (1 - RANGE_W), Pb = P0 * (1 + RANGE_W);
+    const L = CAP / value(1, P0, Pa, Pb, D0, D1);
+    const w0 = (c.weth_is_token0 === "True" || c.weth_is_token0 === "true");
+
+    let d0, d1;
+    try { d0 = BigInt(c.feeGrowthGlobal0X128) - BigInt(p.feeGrowthGlobal0X128); d1 = BigInt(c.feeGrowthGlobal1X128) - BigInt(p.feeGrowthGlobal1X128); }
+    catch (e) { out.push({ d: c.date, fee: null }); continue; }
+    // feeGrowthGlobal は稀にオーバーフローで巻き戻る。増分が負の場合はその日をスキップする。
+    if (d0 < 0n || d1 < 0n) { out.push({ d: c.date, fee: null }); continue; }
+
+    const f0 = Number(d0) / Number(Q128), f1 = Number(d1) / Number(Q128);
+    // token0=WETH なら fg0はWETH建て(D0桁)・fg1はUSDC建て(D1桁)。token1=WETHなら逆。
+    const fee = w0 ? (L * f0 / 10 ** D0 * px + L * f1 / 10 ** D1)
+                    : (L * f0 / 10 ** D1 + L * f1 / 10 ** D0 * px);
+    // プール全体の取引量 = (Δ feeGrowthGlobal × アクティブ流動性) ÷ 手数料率
+    const Lp = parseFloat(c.liquidity);
+    const poolFee = w0 ? (Lp * f0 / 10 ** D0 * px + Lp * f1 / 10 ** D1)
+                        : (Lp * f0 / 10 ** D1 + Lp * f1 / 10 ** D0 * px);
+    const vol = poolFee / (parseInt(c.feeTier, 10) / 1e6);
+    out.push({ d: c.date, fee, liq: Lp, vol });
+  }
+  return out;
+}
+
+function sumApr(fees, n) {
+  const s = fees.filter(x => x.fee != null).slice(-n);
+  if (s.length < Math.min(n, 7)) return null;
+  const tot = s.reduce((a, x) => a + x.fee, 0);
+  return tot / CAP * 365 / s.length * 100;
+}
+function maKey(a, n, key) {
+  const r = [];
+  for (let i = 0; i < a.length; i++) {
+    const s = a.slice(Math.max(0, i - n + 1), i + 1).filter(x => x[key] != null && isFinite(x[key]));
+    r.push(s.length ? s.reduce((t, x) => t + x[key], 0) / s.length : null);
+  }
+  return r;
+}
+function maApr(fees, n) {
+  const r = [];
+  for (let i = 0; i < fees.length; i++) {
+    const s = fees.slice(Math.max(0, i - n + 1), i + 1).filter(x => x.fee != null);
+    r.push(s.length ? s.reduce((a, x) => a + x.fee, 0) / CAP * 365 / s.length * 100 : null);
+  }
+  return r;
+}
+function fmt(v) {
+  if (v == null || !isFinite(v)) return "—";
+  return v >= 1e9 ? (v / 1e9).toFixed(2) + "B" : v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : v >= 1e3 ? (v / 1e3).toFixed(1) + "K" : Math.round(v).toLocaleString();
+}
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+// ============================================
+// DefiLlama 参考値（フルレンジ apyBase）取得: 失敗しても本体機能には影響しない
+// ============================================
+async function fetchDefiLlamaRef() {
+  const ref = {};
+  try {
+    const r = await fetch("https://yields.llama.fi/pools", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    if (!j.data || !Array.isArray(j.data)) throw new Error("unexpected shape");
+    for (const chain of CHAINS) {
+      const llamaChain = DEFILLAMA_CHAIN[chain];
+      const cands = j.data.filter(p => p.project === "uniswap-v3" && p.chain === llamaChain
+        && /(^|-)W?ETH(-|$)/i.test((p.symbol || "").toUpperCase()) && /(^|-)USDC(\.E)?(-|$)/i.test((p.symbol || "").toUpperCase()));
+      if (!cands.length) continue;
+      cands.sort((a, b) => (b.tvlUsd || 0) - (a.tvlUsd || 0));
+      ref[chain] = typeof cands[0].apyBase === "number" ? cands[0].apyBase : null;
+    }
+  } catch (e) {
+    console.warn("DefiLlama reference fetch failed (dashboard continues without it):", e.message);
+  }
+  return ref;
+}
+
+// ============================================
+// フィルターUI
+// ============================================
+function renderFilterButtons(activeChains) {
+  const box = document.getElementById("chain-filters");
+  let html = `<button class="filter-btn active" data-chain="all">全チェーン</button>`;
+  activeChains.forEach(c => html += `<button class="filter-btn" data-chain="${c}">${CHAIN_LABELS[c] || c}</button>`);
+  box.innerHTML = html;
+  box.querySelectorAll(".filter-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      box.querySelectorAll(".filter-btn").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      filters.chain = btn.dataset.chain;
+      applyFilter();
+    });
+  });
+}
+function applyFilter() {
+  document.querySelectorAll("#tbl tbody tr").forEach(tr => {
+    tr.classList.toggle("filtered-out", filters.chain !== "all" && tr.dataset.chain !== filters.chain);
+  });
+  Object.entries(chartInstances).forEach(([_, chart]) => {
+    chart.data.datasets.forEach(ds => { ds.hidden = filters.chain !== "all" && ds._chain !== filters.chain; });
+    chart.update();
+  });
+}
+
+// ============================================
+// メイン
+// ============================================
+(async () => {
+  try {
+    const cfgResp = await fetch(`config.json?t=${Date.now()}`);
+    if (cfgResp.ok) {
+      const cfg = await cfgResp.json();
+      if (cfg.position) {
+        if (typeof cfg.position.capital_usd === "number") CAP = cfg.position.capital_usd;
+        if (typeof cfg.position.range_pct === "number") RANGE_W = cfg.position.range_pct;
+      }
+    }
+  } catch (e) { console.warn("config.json load failed, using defaults ($10,000 / ±20%):", e.message); }
+
+  const tb = document.querySelector("#tbl tbody");
+  const ds = [], dl = [], dv = [];
+  const active = [];
+  const llamaRef = await fetchDefiLlamaRef();
+
+  for (const [i, name] of CHAINS.entries()) {
+    const rows = await loadCSV(name);
+    if (!rows || rows.length < 2) continue;
+    active.push(name);
+    const f = dailyFees(rows);
+    const a30 = sumApr(f, 30), a90 = sumApr(f, 90), all = sumApr(f, 1e9);
+    const last = rows[rows.length - 1];
+    const v30 = maKey(f, 30, "vol"), vLast = v30[v30.length - 1];
+    const liqNow = parseFloat(last.liquidity);
+    const turn = (vLast != null && liqNow > 0) ? (vLast / liqNow) : null;
+    const color = CHAIN_COLORS[name] || "#627eea";
+    const llama = llamaRef[name];
+
+    tb.insertAdjacentHTML("beforeend", `<tr data-chain="${name}">
+      <td>${escapeHtml(CHAIN_LABELS[name] || name)}</td>
+      <td>${(parseInt(last.feeTier, 10) / 10000).toFixed(2)}%</td>
+      <td>${a30 == null ? "—" : a30.toFixed(1) + "%"}</td>
+      <td>${a90 == null ? "—" : a90.toFixed(1) + "%"}</td>
+      <td>${all == null ? "—" : all.toFixed(1) + "%"}</td>
+      <td>${llama == null ? "—" : llama.toFixed(1) + "%"}</td>
+      <td>$${fmt(vLast)}</td>
+      <td>${isFinite(liqNow) ? liqNow.toExponential(2) : "—"}</td>
+      <td>${turn == null ? "—" : turn.toExponential(2)}</td>
+      <td>${rows.length}</td>
+    </tr>`);
+
+    const m30 = maApr(f, 30);
+    ds.push({ label: CHAIN_LABELS[name] || name, _chain: name, data: f.map((x, j) => ({ x: x.d, y: m30[j] })), borderColor: color, borderWidth: 1.8, pointRadius: 0, tension: .2 });
+    dl.push({ label: CHAIN_LABELS[name] || name, _chain: name, data: f.map(x => ({ x: x.d, y: x.liq })), borderColor: color, borderWidth: 1.5, pointRadius: 0 });
+    dv.push({ label: CHAIN_LABELS[name] || name, _chain: name, data: f.map((x, j) => ({ x: x.d, y: v30[j] })), borderColor: color, borderWidth: 1.5, pointRadius: 0 });
+  }
+
+  renderFilterButtons(active);
+
+  if (!ds.length) {
+    document.getElementById("msg").textContent = "data/ にCSVがありません。collect.py --backfill を実行してデータを用意してください。";
+    return;
+  }
+  const opt = { responsive: true, parsing: false, scales: { x: { type: "category", ticks: { maxTicksLimit: 10 } } }, plugins: { legend: { position: "bottom" } } };
+  chartInstances.ch = new Chart(document.getElementById("ch"), { type: "line", data: { datasets: ds }, options: { ...opt, scales: { ...opt.scales, y: { title: { display: true, text: "年率手数料利回り %" } } } } });
+  chartInstances.vol = new Chart(document.getElementById("vol"), { type: "line", data: { datasets: dv }, options: { ...opt, scales: { ...opt.scales, y: { type: "logarithmic", title: { display: true, text: "1日あたり取引量 USD" } } } } });
+  chartInstances.liq = new Chart(document.getElementById("liq"), { type: "line", data: { datasets: dl }, options: { ...opt, scales: { ...opt.scales, y: { type: "logarithmic" } } } });
+})();
+</script>
+</body></html>

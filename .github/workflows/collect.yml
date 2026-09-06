@@ -1,0 +1,33 @@
+name: collect
+on:
+  schedule:
+    - cron: "10 0 * * *"      # 毎日 00:10 UTC（09:10 JST）
+  workflow_dispatch:           # 手動実行も可
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: collect
+        env:
+          RPC_ETHEREUM: ${{ secrets.RPC_ETHEREUM }}
+          RPC_OPTIMISM: ${{ secrets.RPC_OPTIMISM }}
+          RPC_BASE:     ${{ secrets.RPC_BASE }}
+          RPC_ARBITRUM: ${{ secrets.RPC_ARBITRUM }}
+          RPC_BSC:      ${{ secrets.RPC_BSC }}
+          RPC_UNICHAIN: ${{ secrets.RPC_UNICHAIN }}
+        run: python collect.py
+      - name: commit
+        run: |
+          git config user.name  "uv3-monitor"
+          git config user.email "bot@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet || git commit -m "data: $(date -u +%F)"
+          git push
